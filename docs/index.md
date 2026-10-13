@@ -37,6 +37,7 @@ usage/support_new_models/dit_model_guide.md
 usage/checkpoint.md
 usage/checkpoint_conversion.md
 usage/trainer.md
+usage/dit_length_bucketing.md
 usage/agent_workflow.md
 usage/hdfs_fuse_patch.md
 testing.md

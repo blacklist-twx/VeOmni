@@ -72,6 +72,12 @@ class MappingDataset(Dataset):
     def __len__(self) -> int:
         return self.data_len
 
+    def get_column(self, name: str) -> list:
+        """Read source metadata in index order without applying the sample transform."""
+        if name not in self._data.column_names:
+            raise ValueError(f"Missing dataset metadata column: {name}")
+        return list(self._data[name])
+
     def _get_mapped_index(self, index: int) -> int:
         if self.data_len == 0:
             raise IndexError("Cannot index an empty dataset")

@@ -145,8 +145,8 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
 
 
 @DATA_TRANSFORM_REGISTRY.register("dit_offline")
-def process_dit_offline_example(example, **kwargs):
+def process_dit_offline_example(example, length_bucket_column=None, **kwargs):
     import pickle as pk
 
-    processed_example = {key: pk.loads(value) for key, value in example.items()}
+    processed_example = {key: pk.loads(value) for key, value in example.items() if key != length_bucket_column}
     return [processed_example]

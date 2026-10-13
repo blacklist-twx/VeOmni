@@ -96,6 +96,8 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
+    sample_lengths=None,
+    length_bucket_window_batches: int = 50,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -146,6 +148,11 @@ def build_native_dataloader(
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
     """
+    if sample_lengths is not None:
+        if dyn_bsz or isinstance(dataset, IterableDataset) or not in_order:
+            raise ValueError("Length bucketing requires fixed batches, a mapping dataset and in_order=True.")
+        if dataloader_batch_size * get_parallel_state().dp_size != global_batch_size:
+            raise ValueError("Length bucketing requires one global optimizer batch per dataloader step.")
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
@@ -240,6 +247,21 @@ def build_native_dataloader(
             rank=parallel_state.dp_rank,
             shuffle=shuffle,
             seed=seed,
+        )
+
+    if sample_lengths is not None:
+        from .length_bucket import LengthBucketDistributedSampler
+
+        sampler = LengthBucketDistributedSampler(
+            dataset,
+            sample_lengths,
+            global_batch_size,
+            window_batches=length_bucket_window_batches,
+            num_replicas=parallel_state.dp_size,
+            rank=parallel_state.dp_rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
         )
 
     worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None

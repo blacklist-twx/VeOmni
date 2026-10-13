@@ -138,6 +138,14 @@ class DiTModelArguments(ModelArguments):
 @dataclass
 class DiTDataArguments(DataArguments):
     supports_torch_compile = False
+    length_bucket_column: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional positive integer metadata column for fixed-batch DiT length grouping."},
+    )
+    length_bucket_window_batches: int = field(
+        default=50,
+        metadata={"help": "Number of global batches sorted together when DiT length grouping is enabled."},
+    )
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
@@ -356,6 +364,16 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
+        if args.data.length_bucket_column is not None:
+            if (
+                args.data.datasets_type != "mapping"
+                or args.data.dataloader.type != "native"
+                or not args.data.dataloader.in_order
+                or args.train.training_task == "offline_embedding"
+            ):
+                raise ValueError("DiT length bucketing requires mapping/native training with in_order=True.")
+            if not args.data.length_bucket_column or args.data.length_bucket_window_batches < 1:
+                raise ValueError("DiT length bucketing requires a column name and a positive window size.")
         args.train.dyn_bsz = False
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
@@ -386,7 +404,9 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         logger.info(f"args.data.data_transform: {args.data.data_transform}, training_task: {self.training_task}")
         if self.training_task == "offline_training":
-            self.base.data_transform = build_data_transform("dit_offline")
+            self.base.data_transform = build_data_transform(
+                "dit_offline", length_bucket_column=args.data.length_bucket_column
+            )
         else:
             self.base.data_transform = build_data_transform(
                 args.data.data_transform,
@@ -422,6 +442,12 @@ class DiTTrainer:
                 self.base.train_steps = args.train_steps
             else:
                 self.offline_embedding_saver = None
+
+        if args.data.length_bucket_column is not None and self.base.train_dataset is not None:
+            rows = len(self.base.train_dataset)
+            batch = args.train.global_batch_size
+            args._train_steps = rows // batch if args.data.dataloader.drop_last else math.ceil(rows / batch)
+            self.base.train_steps = args.train_steps
 
         # Sync _train_steps across the SP group AFTER padding so every rank
         # agrees on step count (required to avoid deadlocks in broadcast_object_list).
@@ -464,6 +490,12 @@ class DiTTrainer:
                 in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
                 shuffle=args.data.dataloader.shuffle,
+                sample_lengths=(
+                    self.base.train_dataset.get_column(args.data.length_bucket_column)
+                    if args.data.length_bucket_column is not None
+                    else None
+                ),
+                length_bucket_window_batches=args.data.length_bucket_window_batches,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )

@@ -42,6 +42,7 @@ class LTXVideoTransformerModelConfig(PretrainedConfig):
         audio_cross_attention_dim: int = 2048,
         audio_positional_embedding_max_pos: list = None,
         av_ca_timestep_scale_multiplier: int = 1,
+        batch_forward: bool = False,
         **kwargs,
     ):
         """Store the shared LTX architecture settings while preserving LTX-2.3 defaults."""
@@ -78,6 +79,7 @@ class LTXVideoTransformerModelConfig(PretrainedConfig):
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.audio_positional_embedding_max_pos = audio_positional_embedding_max_pos
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
+        self.batch_forward = batch_forward
         super().__init__(**kwargs)
 
     def to_diffuser_dict(self):

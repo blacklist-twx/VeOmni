@@ -4,6 +4,8 @@ model:
   model_path: /path/to/models/LTX-2.5-veomni
   condition_model_path: /path/to/models/LTX-2.5-veomni
   config_path: /path/to/models/LTX-2.5-veomni/config.json
+  model_config:
+    batch_forward: false # Opt in for same-shape microbatches with SP=1.
   condition_model_cfg:
     with_audio: true
     first_frame_conditioning_p: 0.0

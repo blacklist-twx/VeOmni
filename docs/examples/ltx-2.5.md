@@ -93,6 +93,20 @@ when increasing the batch size or step count.
 This recipe covers the BF16 dev model and Conv VAE. Quantized imports, diffusion
 decoder, multishot, duration prediction and IC-LoRA are outside its scope.
 
+### Same-shape microbatches
+
+Set `model.model_config.batch_forward: true` and `train.micro_batch_size: 2`
+(or larger) to run compatible samples together on the batch dimension. This
+opt-in is shared with LTX-2.3 and currently requires **SP=1**. Keep the global
+batch size divisible by microbatch size times data-parallel size.
+
+All samples in a microbatch must have matching video/audio latent shapes and
+text/mask tensor layouts; otherwise the whole microbatch uses the serial path.
+Noise, timesteps, FPS, text masks and conditioned-frame masks remain sample-local,
+and loss remains the mean of the per-sample video-plus-audio losses. Batching
+uses more peak activation memory. Measure throughput and memory on your target
+GPU before choosing a microbatch size; this option does not imply a fixed speedup.
+
 ## Smoke test
 
 On 2026-10-13, the official 22B weights passed real-media preprocessing, training,

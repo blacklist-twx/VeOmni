@@ -137,6 +137,11 @@ training configs consume the precomputed embeddings and do not reload Gemma.
 bash train.sh tasks/train_dit.py configs/dit/ltx2_av_lora.yaml
 ```
 
+For optional same-shape batch execution with `SP=1`, set
+`model.model_config.batch_forward: true` and increase `train.micro_batch_size`.
+See [the shared batching contract](ltx-2.5.md#same-shape-microbatches) for shape,
+loss and memory requirements. The default remains per-sample execution.
+
 ### Audio-Video LoRA (Low VRAM)
 
 For GPUs with limited VRAM, use the low-memory configuration with reduced LoRA rank (16 vs 32):

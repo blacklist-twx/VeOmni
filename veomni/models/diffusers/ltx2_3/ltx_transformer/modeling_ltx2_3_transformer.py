@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 import json
 import os
-from dataclasses import dataclass, replace
+from collections.abc import Sequence
+from dataclasses import dataclass, fields, replace
 
 import torch
 from transformers import PreTrainedModel
@@ -42,6 +43,51 @@ VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors(time=8, height=32, width=32)
 AUDIO_MEL_BINS = 16
 AUDIO_CHANNELS = 8
 DEFAULT_FPS = 24
+
+
+def _batch_modalities(modalities: Sequence[Modality | None]) -> Modality | None:
+    """Join compatible, independently prepared modalities along the batch axis."""
+    first = modalities[0]
+    if first is None:
+        return None
+    values = {}
+    for field in fields(first):
+        value = getattr(first, field.name)
+        values[field.name] = (
+            torch.cat([getattr(modality, field.name) for modality in modalities], dim=0)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
+    # A 2D additive mask is a singleton query mask in the serial attention
+    # adapter. Make its batch axis explicit before B can be mistaken for Q.
+    mask = values["context_mask"]
+    if mask is not None and torch.is_floating_point(mask) and mask.ndim == 2:
+        values["context_mask"] = mask[:, None, None, :]
+    return Modality(**values)
+
+
+def _modalities_match(modalities: Sequence[Modality | None]) -> bool:
+    """Check tensor layouts and mask types without reading accelerator tensor values."""
+    first = modalities[0]
+    if first is None:
+        return all(modality is None for modality in modalities)
+    for modality in modalities:
+        if modality is None:
+            return False
+        for field in fields(first):
+            expected, actual = getattr(first, field.name), getattr(modality, field.name)
+            if isinstance(expected, torch.Tensor):
+                if (
+                    not isinstance(actual, torch.Tensor)
+                    or actual.shape != expected.shape
+                    or actual.dtype != expected.dtype
+                    or actual.device != expected.device
+                    or actual.shape[0] != 1
+                ):
+                    return False
+            elif actual is not expected:
+                return False
+    return True
 
 
 def LTXSPAttention_forward(
@@ -346,10 +392,13 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         ref_seq_len: list[int] | None = None,
     ):
         """Prepare per-sample audio-video modalities and return predictions with optional training loss."""
+        if self.config.batch_forward and get_parallel_state().sp_enabled:
+            raise ValueError("LTX batch_forward currently requires SP=1; disable it for sequence parallelism.")
         video_patchifier = VideoLatentPatchifier(patch_size=1)
         audio_patchifier = AudioPatchifier(patch_size=1) if self.config.with_audio else None
         predictions = []
         audio_predictions = []
+        prepared_samples = []
 
         model_device = next(self.parameters()).device
         compute_dtype = next(self.parameters()).dtype
@@ -429,6 +478,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             )
 
             audio_modality = None
+            audio_latent_shape = None
             if self.config.with_audio and audio_hidden_states is not None and audio_timestep is not None:
                 sample_audio_hs = audio_hidden_states[sample_idx]
                 sample_audio_ts = audio_timestep[sample_idx]
@@ -461,10 +511,32 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
                     context_mask=sample_ctx_mask,
                 )
 
-            perturbations = BatchedPerturbationConfig.empty(1)
+            prepared_samples.append((video_modality, audio_modality, latent_shape, audio_latent_shape))
 
-            vx, ax = LTXModel.forward(self, video=video_modality, audio=audio_modality, perturbations=perturbations)
+        videos, audios, video_shapes, audio_shapes = zip(*prepared_samples)
+        use_batch = (
+            self.config.batch_forward
+            and len(prepared_samples) > 1
+            and all(shape == video_shapes[0] for shape in video_shapes)
+            and all(shape == audio_shapes[0] for shape in audio_shapes)
+            and _modalities_match(videos)
+            and _modalities_match(audios)
+        )
+        if use_batch:
+            vx, ax = LTXModel.forward(
+                self,
+                video=_batch_modalities(videos),
+                audio=_batch_modalities(audios),
+                perturbations=BatchedPerturbationConfig.empty(len(prepared_samples)),
+            )
+            outputs = zip(vx.split(1), ax.split(1) if ax is not None else [None] * len(prepared_samples))
+        else:
+            outputs = (
+                LTXModel.forward(self, video=video, audio=audio, perturbations=BatchedPerturbationConfig.empty(1))
+                for video, audio in zip(videos, audios)
+            )
 
+        for (vx, ax), latent_shape, audio_latent_shape in zip(outputs, video_shapes, audio_shapes):
             prediction = video_patchifier.unpatchify(vx, latent_shape)
             predictions.append(prediction)
 

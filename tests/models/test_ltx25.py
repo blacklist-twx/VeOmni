@@ -94,6 +94,178 @@ def batch():
     )
 
 
+def two_sample_batch(i2av=False, mask_kind="additive"):
+    """Use distinct inputs, times, fps and conditioning masks in the same shape bucket."""
+    inputs = batch()
+    for values in inputs.values():
+        values.append(values[0].clone() * 0.7 + 0.2)
+    inputs["timestep"] = [torch.tensor(0.25), torch.tensor(0.75)]
+    inputs["audio_timestep"] = [torch.tensor(0.15), torch.tensor(0.65)]
+    inputs["fps"] = [24.0, 30.0]
+    masks = [torch.ones(1, 128, dtype=torch.long) for _ in range(2)]
+    masks[0][:, 90:] = 0
+    masks[1][:, 75:] = 0
+    if mask_kind.startswith("additive"):
+        masks = [torch.zeros(1, 1, 1, 128).masked_fill(~mask[:, None, None].bool(), -torch.inf) for mask in masks]
+        if mask_kind == "additive_2d":
+            masks = [mask[:, 0, 0] for mask in masks]
+    if mask_kind != "none":
+        inputs["context_mask"] = masks
+    if i2av:
+        inputs["video_loss_mask"] = [torch.ones(12, dtype=torch.bool) for _ in range(2)]
+        inputs["video_loss_mask"][0][:4] = False
+        inputs["video_loss_mask"][1][:8] = False
+    return inputs
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.5"])
+@pytest.mark.parametrize("i2av", [False, True])
+@pytest.mark.parametrize("mask_kind", ["additive", "additive_2d", "integer", "none"])
+def test_same_shape_batch_matches_serial_predictions_loss_and_gradients(monkeypatch, version, i2av, mask_kind):
+    """Batching retains sample-local AV conditioning and equal sample loss weighting."""
+    from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXModel
+
+    overrides = {}
+    if version == "2.3":
+        overrides = dict(
+            use_keyframes_abs_pos_embedding=False,
+            ff_bias=True,
+            cross_attention_adaln=False,
+            caption_proj_before_connector=False,
+            apply_gated_attention=False,
+        )
+    serial = tiny_model(tiny_config(**overrides)).eval()
+    batched = copy.deepcopy(serial)
+    batched.config.batch_forward = True
+    inputs = two_sample_batch(i2av, mask_kind)
+    expected = serial(**inputs)
+    expected.loss["mse_loss"].backward()
+
+    calls = []
+    real_forward = LTXModel.forward
+
+    def observed_forward(model, video, audio, perturbations):
+        """Count actual core calls without substituting predictions or gradients."""
+        calls.append(video.latent.shape[0])
+        return real_forward(model, video, audio, perturbations)
+
+    monkeypatch.setattr(LTXModel, "forward", observed_forward)
+    actual = batched(**inputs)
+    actual.loss["mse_loss"].backward()
+    assert calls == [2]
+    torch.testing.assert_close(actual.loss["mse_loss"], expected.loss["mse_loss"])
+    for actual_values, expected_values in (
+        (actual.predictions, expected.predictions),
+        (actual.audio_predictions, expected.audio_predictions),
+    ):
+        for actual_value, expected_value in zip(actual_values, expected_values, strict=True):
+            torch.testing.assert_close(actual_value, expected_value, atol=2e-6, rtol=2e-5)
+    for (name, param), (_, reference) in zip(batched.named_parameters(), serial.named_parameters(), strict=True):
+        assert (param.grad is None) == (reference.grad is None), name
+        if reference.grad is not None:
+            torch.testing.assert_close(param.grad, reference.grad, atol=2e-6, rtol=2e-4, msg=name)
+
+
+@pytest.mark.parametrize("difference", ["video", "audio", "text", "mask"])
+def test_batch_forward_falls_back_for_incompatible_samples(monkeypatch, difference):
+    """Heterogeneous shapes and mask types keep the existing per-sample execution."""
+    from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXModel
+
+    model = tiny_model().eval()
+    inputs = two_sample_batch()
+    if difference == "video":
+        inputs["hidden_states"][1] = inputs["hidden_states"][1][:, :, :2]
+        inputs["training_target"][1] = inputs["training_target"][1][:, :, :2]
+    elif difference == "audio":
+        inputs["audio_hidden_states"][1] = inputs["audio_hidden_states"][1][:, :, :5]
+        inputs["audio_training_target"][1] = inputs["audio_training_target"][1][:, :, :5]
+    elif difference == "text":
+        inputs["encoder_hidden_states"][1] = inputs["encoder_hidden_states"][1][:, :100]
+        inputs["audio_encoder_hidden_states"][1] = inputs["audio_encoder_hidden_states"][1][:, :100]
+        inputs["context_mask"][1] = inputs["context_mask"][1][..., :100]
+    else:
+        inputs["context_mask"][1] = torch.ones(1, 128, dtype=torch.long)
+    expected = model(**inputs)
+    model.config.batch_forward = True
+    real_forward = LTXModel.forward
+    calls = []
+
+    def observed_forward(model, video, audio, perturbations):
+        """Record batch sizes at the core transformer boundary."""
+        calls.append(video.latent.shape[0])
+        return real_forward(model, video, audio, perturbations)
+
+    monkeypatch.setattr(LTXModel, "forward", observed_forward)
+    actual = model(**inputs)
+    assert calls == [1, 1]
+    torch.testing.assert_close(actual.loss["mse_loss"], expected.loss["mse_loss"], atol=0, rtol=0)
+    for actual_value, expected_value in zip(actual.predictions, expected.predictions, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, atol=0, rtol=0)
+
+
+def test_batch_forward_video_only_and_config_roundtrip():
+    """Video-only batches work and the opt-in survives model config serialization."""
+    config = tiny_config(with_audio=False, batch_forward=True)
+    restored = LTXVideoTransformerModelConfig(**config.to_diffuser_dict())
+    assert restored.batch_forward
+    assert not tiny_config().batch_forward
+    model = tiny_model(restored).eval()
+    inputs = {key: value for key, value in two_sample_batch().items() if not key.startswith("audio_")}
+    actual = model(**inputs)
+    model.config.batch_forward = False
+    expected = model(**inputs)
+    assert actual.audio_predictions is None
+    torch.testing.assert_close(actual.loss["mse_loss"], expected.loss["mse_loss"])
+    for actual_value, expected_value in zip(actual.predictions, expected.predictions, strict=True):
+        torch.testing.assert_close(actual_value, expected_value)
+
+
+def test_batch_forward_preserves_sample_and_text_mask_isolation():
+    """Other samples and masked text tokens cannot change a sample's predictions."""
+    model = tiny_model(tiny_config(batch_forward=True)).eval()
+    inputs = two_sample_batch(i2av=True)
+    with torch.no_grad():
+        expected = model(**inputs)
+        changed = copy.deepcopy(inputs)
+        changed["hidden_states"][0].add_(10)
+        changed["audio_hidden_states"][0].add_(10)
+        changed["encoder_hidden_states"][1][:, 75:].add_(100)
+        changed["audio_encoder_hidden_states"][1][:, 75:].add_(100)
+        actual = model(**changed)
+    torch.testing.assert_close(actual.predictions[1], expected.predictions[1], atol=0, rtol=0)
+    torch.testing.assert_close(actual.audio_predictions[1], expected.audio_predictions[1], atol=0, rtol=0)
+    assert not torch.allclose(actual.predictions[0], expected.predictions[0])
+
+
+def test_batch_forward_with_gradient_checkpointing():
+    """Training checkpoint recomputation retains the batch layout and gradients."""
+    model = tiny_model(tiny_config(batch_forward=True)).train()
+    reference = copy.deepcopy(model)
+    model.set_gradient_checkpointing(True)
+    inputs = two_sample_batch(i2av=True)
+    actual = model(**inputs)
+    expected = reference(**inputs)
+    actual.loss["mse_loss"].backward()
+    expected.loss["mse_loss"].backward()
+    torch.testing.assert_close(actual.loss["mse_loss"], expected.loss["mse_loss"], atol=0, rtol=0)
+    for (name, param), (_, reference_param) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert (param.grad is None) == (reference_param.grad is None), name
+        if reference_param.grad is not None:
+            torch.testing.assert_close(param.grad, reference_param.grad, atol=0, rtol=0, msg=name)
+
+
+def test_batch_forward_rejects_sequence_parallelism(monkeypatch):
+    """Do not silently enable unvalidated SP collectives for the optional batch path."""
+    from veomni.models.diffusers.ltx2_3.ltx_transformer import modeling_ltx2_3_transformer as modeling
+
+    model = tiny_model(tiny_config(batch_forward=True))
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=True))
+    with pytest.raises(ValueError, match="requires SP=1"):
+        model(**batch())
+
+
 def sdpa_backend_flags():
     """Capture all SDPA backend switches for validation-harness isolation checks."""
     return (

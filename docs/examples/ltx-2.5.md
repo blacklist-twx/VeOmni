@@ -87,6 +87,14 @@ when increasing the batch size or step count.
   receive timestep zero and are excluded from video loss.
 - Sampling/loss retain LTX-2.3 behavior: default `shifted_logit_normal`, video MSE
   plus audio MSE without extra weighting. The existing `uniform` mode remains available.
+- Set `model.condition_model_cfg.audio_conditioning: true` for audio-to-video SFT.
+  Every sample must include audio latents and audio text features from the AV cache.
+  Audio stays clean at timestep zero and has no loss; the audio conditioning
+  path remains trainable through video cross-attention. Video uses the existing first-frame
+  setting. This follows the official [A2V recipe](https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-trainer/configs/a2v_lora.yaml)
+  and [training strategy](https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py).
+  The default is `false`, preserving joint AV training. A2V has CPU regression
+  coverage; the real-weight smoke results below cover joint AV training.
 - The recipe saves DCP training state and LoRA adapters. Resume by setting
   `train.checkpoint.load_path` to the saved step directory, using the same base weights.
 

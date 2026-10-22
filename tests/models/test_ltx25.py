@@ -24,6 +24,7 @@ from veomni.models.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transfo
 from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import (
     LTXVideoTransformerModel,
     apply_veomni_ltx_transformer_patch,
+    compute_ltx2_loss,
 )
 
 
@@ -294,6 +295,139 @@ def test_prepare_refuses_missing_weights(tmp_path):
     with pytest.raises(ValueError, match="missing=.*keyframes_abs_pos_embedding"):
         prepare_training_directory(str(pack), str(tmp_path / "prepared"))
     assert not (tmp_path / "prepared").exists()
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.5"])
+@pytest.mark.parametrize("first_frame", [0.0, 1.0])
+def test_audio_to_video_conditioning_and_gradients(tmp_path, version, first_frame):
+    """A2V keeps audio clean at sigma zero, trains video, and retains audio conditioning gradients."""
+    config = tiny_config()
+    if version == "2.3":
+        config = tiny_config(
+            ff_bias=True,
+            use_keyframes_abs_pos_embedding=False,
+            cross_attention_adaln=False,
+            caption_proj_before_connector=False,
+            apply_gated_attention=False,
+        )
+    model = tiny_model(config)
+    pack = tmp_path / "official.safetensors"
+    make_pack(pack, model)
+    condition_config = LTXVideoConditionModelConfig(
+        base_model_path=str(pack), with_audio=True, audio_conditioning=True, first_frame_conditioning_p=first_frame
+    )
+    condition = LTXVideoConditionModel(condition_config, meta_init=True).float()
+    raw = batch()
+    inputs = condition.process_condition(
+        latents=raw["hidden_states"],
+        context=raw["encoder_hidden_states"],
+        context_mask=[torch.arange(128).unsqueeze(0) < 96],
+        audio_context=raw["audio_encoder_hidden_states"],
+        audio_latents=raw["audio_hidden_states"],
+    )
+    torch.testing.assert_close(inputs["audio_hidden_states"][0], raw["audio_hidden_states"][0], rtol=0, atol=0)
+    assert not inputs["audio_timestep"][0].any()
+    assert not inputs["audio_loss_mask"][0].any()
+    assert inputs["video_loss_mask"][0].sum() == (8 if first_frame else 12)
+    if first_frame:
+        torch.testing.assert_close(inputs["hidden_states"][0][:, :, :1], raw["hidden_states"][0][:, :, :1])
+
+    modalities = []
+    original = model.audio_args_preprocessor.prepare
+
+    def capture(*args, **kwargs):
+        modalities.append(args[0])
+        return original(*args, **kwargs)
+
+    model.audio_args_preprocessor.prepare = capture
+    inputs["audio_hidden_states"][0] = inputs["audio_hidden_states"][0].detach().requires_grad_()
+    output = model(**inputs)
+    assert not modalities[0].sigma.any() and not modalities[0].timesteps.any()
+    expected = compute_ltx2_loss(output.predictions, inputs["training_target"], inputs["video_loss_mask"])
+    torch.testing.assert_close(output.loss["mse_loss"], expected["mse_loss"], rtol=0, atol=0)
+    changed_targets = {**inputs, "audio_training_target": [torch.full_like(inputs["audio_training_target"][0], 100)]}
+    torch.testing.assert_close(model(**changed_targets).loss["mse_loss"], expected["mse_loss"], rtol=0, atol=0)
+    changed_audio = {**inputs, "audio_hidden_states": [inputs["audio_hidden_states"][0].detach() + 1]}
+    assert not torch.allclose(model(**changed_audio).predictions[0], output.predictions[0], rtol=0, atol=1e-7)
+
+    output.loss["mse_loss"].backward()
+    assert inputs["audio_hidden_states"][0].grad.norm() > 0
+    assert model.audio_patchify_proj.weight.grad.norm() > 0
+    assert model.transformer_blocks[0].audio_to_video_attn.to_k.weight.grad.norm() > 0
+    assert torch.count_nonzero(model.audio_proj_out.weight.grad) == 0
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
+@pytest.mark.parametrize("mask_kind", ["none", "all", "partial", "empty"])
+def test_audio_loss_mask_matches_selected_tokens_and_gradients(mask_kind):
+    """Audio masks reduce over valid temporal tokens and give masked tokens zero gradient."""
+    video = torch.randn(2, 2, 3, 2, 2, requires_grad=True)
+    audio = torch.randn(2, 3, 4, 5, requires_grad=True)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    if mask_kind == "partial":
+        mask = torch.tensor([[True, False, True, False], [False, True, False, False]])
+    elif mask_kind == "empty":
+        mask.zero_()
+    actual = compute_ltx2_loss(
+        [video],
+        [torch.zeros_like(video)],
+        None,
+        audio_predictions=[audio],
+        audio_training_targets=[torch.ones_like(audio)],
+        audio_loss_masks=None if mask_kind == "none" else [mask],
+    )["mse_loss"]
+    video_ref = video.detach().clone().requires_grad_()
+    audio_ref = audio.detach().clone().requires_grad_()
+    expected_samples = []
+    for index in range(2):
+        selected = audio_ref[index, :, mask[index], :] - 1
+        audio_loss = selected.square().mean() if selected.numel() else audio_ref[index].sum() * 0
+        expected_samples.append(video_ref[index].square().mean() + audio_loss)
+    expected = torch.stack(expected_samples).mean()
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(video.grad, video_ref.grad)
+    torch.testing.assert_close(audio.grad, audio_ref.grad)
+
+
+@pytest.mark.parametrize("missing", ["audio_latents", "audio_context", "reference_latents", "with_audio"])
+def test_audio_to_video_rejects_incompatible_inputs(missing):
+    """Fail before noise sampling if an A2V sample lacks its required conditioning."""
+    condition = object.__new__(LTXVideoConditionModel)
+    condition.config = LTXVideoConditionModelConfig(with_audio=True, audio_conditioning=True)
+    inputs = {
+        "latents": [torch.zeros(1, 8, 3, 2, 2)],
+        "context": [torch.zeros(1, 128, 32)],
+        "audio_latents": [torch.zeros(1, 2, 7, 4)],
+        "audio_context": [torch.zeros(1, 128, 32)],
+    }
+    if missing == "reference_latents":
+        inputs[missing] = inputs["latents"]
+    elif missing == "with_audio":
+        condition.config.with_audio = False
+    else:
+        inputs[missing] = [None]
+    with pytest.raises(ValueError, match="requires|does not support"):
+        condition.process_condition(**inputs)
+
+
+def test_audio_to_video_config_and_default_av_compatibility(tmp_path):
+    """The new option serializes and the default AV objective remains unchanged."""
+    with pytest.raises(ValueError, match="requires with_audio"):
+        LTXVideoConditionModelConfig(audio_conditioning=True)
+    config = LTXVideoConditionModelConfig(with_audio=True, audio_conditioning=True)
+    config.save_pretrained(tmp_path)
+    assert LTXVideoConditionModelConfig.from_pretrained(str(tmp_path)).audio_conditioning
+    assert not LTXVideoConditionModelConfig().audio_conditioning
+    model = tiny_model()
+    raw = batch()
+    output = model(**raw)
+    masked = model(**raw, audio_loss_mask=[torch.ones(1, 7, dtype=torch.bool)])
+    torch.testing.assert_close(output.loss["mse_loss"], masked.loss["mse_loss"], rtol=0, atol=0)
+    expected = (output.predictions[0] - raw["training_target"][0]).float().square().mean()
+    expected += (output.audio_predictions[0] - raw["audio_training_target"][0]).float().square().mean()
+    torch.testing.assert_close(output.loss["mse_loss"], expected, rtol=0, atol=0)
 
 
 def test_native_lora_update_save_reload(tmp_path):

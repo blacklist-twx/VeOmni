@@ -6,6 +6,7 @@ model:
   config_path: /path/to/models/LTX-2.5-veomni/config.json
   condition_model_cfg:
     with_audio: true
+    audio_conditioning: false  # Set true for audio-to-video SFT with clean audio conditioning.
     first_frame_conditioning_p: 0.0
     timestep_sampling_mode: shifted_logit_normal
   lora_config:

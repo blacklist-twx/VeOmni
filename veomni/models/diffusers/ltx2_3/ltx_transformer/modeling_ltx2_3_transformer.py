@@ -480,6 +480,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
                 video_loss_mask,
                 audio_predictions=audio_predictions if audio_predictions else None,
                 audio_training_targets=audio_training_target,
+                audio_loss_masks=audio_loss_mask,
             )
             loss = loss_dict
 
@@ -516,7 +517,11 @@ def compute_ltx2_loss(
     video_loss_masks: list[torch.Tensor] | None,
     audio_predictions: list[torch.Tensor] | None = None,
     audio_training_targets: list[torch.Tensor] | None = None,
+    audio_loss_masks: list[torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """Average video and audio MSE per sample, excluding conditioned tokens in each modality."""
+    if audio_loss_masks is not None and len(audio_loss_masks) != len(predictions):
+        raise ValueError("Audio loss masks must have one entry per sample.")
     per_sample_losses = []
 
     for i, (prediction, target) in enumerate(zip(predictions, training_targets)):
@@ -544,7 +549,17 @@ def compute_ltx2_loss(
         if audio_predictions is not None and audio_training_targets is not None and i < len(audio_predictions):
             audio_pred = audio_predictions[i].to(dtype=torch.float32)
             audio_target = audio_training_targets[i].to(dtype=torch.float32)
-            audio_loss = (audio_pred - audio_target).pow(2).mean(dim=tuple(range(1, audio_pred.dim())))
+            audio_error = (audio_pred - audio_target).pow(2)
+            sample_alm = audio_loss_masks[i] if audio_loss_masks is not None else None
+            if sample_alm is not None:
+                audio_batch, _, audio_length, _ = audio_pred.shape
+                if sample_alm.shape != (audio_batch, audio_length):
+                    raise ValueError("Audio loss masks must have shape [batch, audio_length].")
+                loss_mask = sample_alm.to(device=audio_pred.device, dtype=torch.bool)[:, None, :, None]
+                audio_loss = (audio_error * loss_mask).mean(dim=(1, 2, 3))
+                audio_loss = audio_loss / loss_mask.float().mean(dim=(1, 2, 3)).clamp(min=1e-8)
+            else:
+                audio_loss = audio_error.mean(dim=tuple(range(1, audio_pred.dim())))
             per_sample_loss = per_sample_loss + audio_loss
 
         per_sample_losses.append(per_sample_loss)

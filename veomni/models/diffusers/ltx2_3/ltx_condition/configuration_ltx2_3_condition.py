@@ -21,6 +21,7 @@ class LTXVideoConditionModelConfig(PretrainedConfig):
         with_audio: bool = False,
         first_frame_conditioning_p: float = 0.5,
         timestep_sampling_mode: str = "shifted_logit_normal",
+        audio_conditioning: bool = False,
         **kwargs,
     ):
         self.base_model_path = base_model_path
@@ -34,6 +35,9 @@ class LTXVideoConditionModelConfig(PretrainedConfig):
         self.shift = shift
         self.video_max_size = video_max_size
         self.with_audio = with_audio
+        self.audio_conditioning = audio_conditioning
+        if audio_conditioning and not with_audio:
+            raise ValueError("audio_conditioning requires with_audio=True.")
         self.first_frame_conditioning_p = first_frame_conditioning_p
         self.timestep_sampling_mode = timestep_sampling_mode
         super().__init__(**kwargs)

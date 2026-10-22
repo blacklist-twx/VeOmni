@@ -335,6 +335,7 @@ class LTXVideoConditionModel(PreTrainedModel):
             context_mask: List of attention mask tensors [B, S]. If None, all tokens are valid.
             audio_context: List of pre-computed audio feature tensors [B, S, D]. If None, no audio features.
             audio_latents: List of audio latent tensors [B, C, T, F]. If None, no audio latents.
+                With ``audio_conditioning=True``, keep them clean and exclude audio from the loss.
             first_frame_conditioning_p: Probability of conditioning on the first frame.
                 Falls back to ``self.config.first_frame_conditioning_p`` if None.
             timestep_sampling_mode: "shifted_logit_normal" or "uniform".
@@ -346,6 +347,15 @@ class LTXVideoConditionModel(PreTrainedModel):
                     kwargs, latents, context, context_mask, audio_context, audio_latents, reference_latents, fps
                 )
             )
+
+        if self.config.audio_conditioning:
+            if not self.config.with_audio:
+                raise ValueError("audio_conditioning requires with_audio=True.")
+            if reference_latents is not None and any(value is not None for value in reference_latents):
+                raise ValueError("Audio-to-video training does not support IC-LoRA reference latents.")
+            for name, values in (("audio_latents", audio_latents), ("audio_context", audio_context)):
+                if values is None or len(values) != len(latents) or any(value is None for value in values):
+                    raise ValueError(f"Audio-to-video training requires {name} for every sample.")
 
         if first_frame_conditioning_p is None:
             first_frame_conditioning_p = self.config.first_frame_conditioning_p
@@ -491,20 +501,29 @@ class LTXVideoConditionModel(PreTrainedModel):
 
             if self.config.with_audio and sample_audio_latents is not None and sample_ref_latents is None:
                 audio_on_device = sample_audio_latents.to(device=device, dtype=compute_dtype)
-                audio_noise = torch.randn(
-                    audio_on_device.shape,
-                    dtype=compute_dtype,
-                    device=device,
-                )
-
-                noisy_audio = self.scheduler.scale_noise(audio_on_device, timestep, audio_noise)
-                audio_training_target = audio_noise - audio_on_device
+                if self.config.audio_conditioning:
+                    # Official A2V keeps the audio modality clean, with sigma and loss zero.
+                    noisy_audio = audio_on_device
+                    audio_timestep = torch.zeros_like(timestep)
+                    # Retain a zero-weight graph through the audio output for distributed training.
+                    audio_training_target = torch.zeros_like(audio_on_device)
+                else:
+                    audio_noise = torch.randn(
+                        audio_on_device.shape,
+                        dtype=compute_dtype,
+                        device=device,
+                    )
+                    noisy_audio = self.scheduler.scale_noise(audio_on_device, timestep, audio_noise)
+                    audio_training_target = audio_noise - audio_on_device
+                    audio_timestep = timestep
 
                 audio_seq_len = noisy_audio.shape[2]
-                audio_loss_mask = torch.ones(B, audio_seq_len, dtype=torch.bool, device=device)
+                audio_loss_mask = torch.full(
+                    (B, audio_seq_len), not self.config.audio_conditioning, dtype=torch.bool, device=device
+                )
 
                 packed_conditions["audio_hidden_states"].append(noisy_audio)
-                packed_conditions["audio_timestep"].append(timestep)
+                packed_conditions["audio_timestep"].append(audio_timestep)
                 packed_conditions["audio_encoder_hidden_states"].append(audio_embeds)
                 packed_conditions["audio_training_target"].append(audio_training_target)
                 packed_conditions["audio_loss_mask"].append(audio_loss_mask)

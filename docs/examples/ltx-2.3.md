@@ -129,6 +129,12 @@ data:
 The Gemma path is used by the preprocessing command; the shipped offline
 training configs consume the precomputed embeddings and do not reload Gemma.
 
+For audio-to-video SFT, set `model.condition_model_cfg.audio_conditioning: true`
+with `with_audio: true`. Audio stays clean at timestep zero and only video is
+supervised, following the official [A2V recipe](https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-trainer/configs/a2v_lora.yaml).
+Every sample needs audio latents and audio text features. IC-LoRA reference
+latents cannot be combined with this mode. The default remains joint AV training.
+
 ## Start training on GPU/NPU
 
 ### Audio-Video LoRA (default)

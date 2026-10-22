@@ -90,11 +90,9 @@ from pathlib import Path
 from typing import Any
 
 import av
-import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageOps
-from pillow_heif import register_heif_opener
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.transforms import functional as TF
@@ -104,8 +102,6 @@ from tqdm import tqdm
 import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
 from veomni.utils.device import get_device_type
 
-
-register_heif_opener()
 
 VAE_SPATIAL_FACTOR = 32
 VAE_TEMPORAL_FACTOR = 8
@@ -910,7 +906,9 @@ def _open_image_as_srgb(image_path):
     import io
 
     from PIL import ExifTags, ImageCms
+    from pillow_heif import register_heif_opener
 
+    register_heif_opener()
     exif_colorspace_srgb = 1
 
     with Image.open(image_path) as img_raw:
@@ -1581,6 +1579,8 @@ def compute_reference_frames(images: torch.Tensor) -> torch.Tensor:
     Returns:
         Binary edge masks tensor of shape ``[B, 3, H, W]``.
     """
+    import cv2
+
     if images.shape[1] == 3:
         images = TF.rgb_to_grayscale(images)
 
@@ -1730,8 +1730,8 @@ def save_parquet(
         pad_to_multiple_of: If set, pad total samples to be divisible by this number.
             Useful for ensuring even distribution across DP ranks in distributed training.
             For example, set to ``dp_size`` to prevent FSDP2 deadlocks.
-        with_audio: If True, validate and report audio field coverage.
-            Warns when audio_latents or audio_prompt_embeds are missing.
+        with_audio: Require audio_latents and audio_prompt_embeds in every exported row.
+            Reject incomplete rows before writing any parquet shard.
     """
     import pickle as pk
 
@@ -1754,11 +1754,7 @@ def save_parquet(
 
     has_audio_latents_dir = audio_latents_dir.is_dir()
     if with_audio and not has_audio_latents_dir:
-        print(
-            f"WARNING: --with_audio is set but audio_latents directory not found: {audio_latents_dir}\n"
-            f"  Audio latents will NOT be included in the parquet output.\n"
-            f"  Re-run the 'preprocess' command with --with_audio to generate audio latents."
-        )
+        raise ValueError(f"Audio latents directory is required with --with_audio: {audio_latents_dir}")
 
     has_ref_latents_dir = ref_latents_dir.is_dir()
     if reference_latents_dir and not has_ref_latents_dir:
@@ -1790,8 +1786,7 @@ def save_parquet(
     skipped = 0
     audio_latents_count = 0
     audio_prompt_embeds_count = 0
-    missing_audio_latents = 0
-    missing_audio_prompt_embeds = 0
+    incomplete_audio = []
 
     for latent_file in tqdm(latent_files, desc="Packing parquet"):
         rel = latent_file.relative_to(latents_dir)
@@ -1819,10 +1814,8 @@ def save_parquet(
         else:
             merged["conditions"] = cond_data
 
-        if "audio_prompt_embeds" in merged:
+        if merged.get("audio_prompt_embeds") is not None:
             audio_prompt_embeds_count += 1
-        elif with_audio:
-            missing_audio_prompt_embeds += 1
 
         if has_audio_latents_dir:
             audio_file = audio_latents_dir / rel
@@ -1838,9 +1831,8 @@ def save_parquet(
                         merged["audio_duration"] = audio_data["duration"]
                 else:
                     merged["audio_latents"] = audio_data
-                audio_latents_count += 1
-            elif with_audio:
-                missing_audio_latents += 1
+                if merged.get("audio_latents") is not None:
+                    audio_latents_count += 1
 
         if has_ref_latents_dir:
             ref_file = ref_latents_dir / rel
@@ -1863,7 +1855,19 @@ def save_parquet(
             if with_audio:
                 print(f"  First sample audio fields: {_audio_keys if _audio_keys else '(none)'}")
 
+        if with_audio:
+            missing = [key for key in ("audio_latents", "audio_prompt_embeds") if merged.get(key) is None]
+            if missing:
+                incomplete_audio.append(f"{rel}: {', '.join(missing)}")
         all_samples.append(_to_bytes(merged))
+
+    if incomplete_audio:
+        raise ValueError("Incomplete audio-video cache rows: " + "; ".join(incomplete_audio))
+    # Arrow infers from the first row; explicitly share one schema across every shard.
+    # Pickled None preserves the existing dit_offline decoder's bytes-only contract.
+    keys = sorted({key for sample in all_samples for key in sample})
+    missing_value = pk.dumps(None)
+    all_samples = [{key: sample.get(key, missing_value) for key in keys} for sample in all_samples]
 
     original_count = len(all_samples)
 
@@ -1896,25 +1900,8 @@ def save_parquet(
         print("\n=== Audio field summary ===")
         print(f"  audio_latents:       {audio_latents_count}/{original_count} samples")
         print(f"  audio_prompt_embeds: {audio_prompt_embeds_count}/{original_count} samples")
-        if with_audio:
-            _audio_ok = audio_latents_count > 0 and audio_prompt_embeds_count > 0
-            if _audio_ok:
-                print("  Audio-video training is READY.")
-            else:
-                _missing_parts = []
-                if missing_audio_latents > 0:
-                    _missing_parts.append(f"audio_latents missing for {missing_audio_latents} samples")
-                if missing_audio_prompt_embeds > 0:
-                    _missing_parts.append(f"audio_prompt_embeds missing for {missing_audio_prompt_embeds} samples")
-                if audio_latents_count == 0 and not has_audio_latents_dir:
-                    _missing_parts.append("audio_latents/ directory does not exist")
-                if audio_prompt_embeds_count == 0:
-                    _missing_parts.append("conditions files lack audio_prompt_embeds")
-                print(
-                    f"  WARNING: Audio data is INCOMPLETE — loss will be video-only.\n"
-                    f"  Issues: {'; '.join(_missing_parts)}\n"
-                    f"  Fix: re-run 'preprocess' with --with_audio, then re-run 'save-parquet --with_audio'."
-                )
+        if with_audio and original_count:
+            print("  Audio-video training is READY.")
 
 
 # ---------------------------------------------------------------------------

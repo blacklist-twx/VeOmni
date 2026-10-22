@@ -296,6 +296,148 @@ def test_prepare_refuses_missing_weights(tmp_path):
     assert not (tmp_path / "prepared").exists()
 
 
+@pytest.mark.parametrize("shard_size", [1, 8])
+@pytest.mark.parametrize("batched_cache", [False, True])
+def test_cache_parquet_training_roundtrip(tmp_path, shard_size, batched_cache):
+    """Preserve late optional columns and row alignment through the actual offline pipeline."""
+    from datasets import Dataset
+
+    from veomni.data.multimodal.dit.data_transform import process_dit_offline_example
+    from veomni.models.diffusers.ltx2_3.ltx_condition.preprocess_dataset import save_parquet
+    from veomni.trainer.dit_trainer import DiTDataCollator
+
+    model = tiny_model()
+    pack = tmp_path / "official.safetensors"
+    make_pack(pack, model)
+    directory = tmp_path / "prepared"
+    prepare_training_directory(str(pack), str(directory))
+    config = LTXVideoConditionModelConfig.from_pretrained(
+        str(directory), with_audio=True, first_frame_conditioning_p=0
+    )
+    condition = LTXVideoConditionModel(config, meta_init=True).float()
+    cache = tmp_path / "cache"
+    for name in ("latents", "conditions", "audio_latents"):
+        (cache / name).mkdir(parents=True)
+    raw = batch()
+    rows = []
+    for index in range(2):
+
+        def cached(value):
+            return value if batched_cache else value.squeeze(0)
+
+        row = {
+            "latents": cached(raw["hidden_states"][0] + index),
+            "video_prompt_embeds": cached(raw["encoder_hidden_states"][0] + index),
+            "audio_prompt_embeds": cached(raw["audio_encoder_hidden_states"][0] + index),
+            "audio_latents": cached(raw["audio_hidden_states"][0] + index),
+        }
+        latent = {"latents": row["latents"]}
+        text = {key: row[key] for key in ("video_prompt_embeds", "audio_prompt_embeds")}
+        audio = {"latents": row["audio_latents"]}
+        if index:
+            row["fps"] = latent["fps"] = 18.0
+            row["prompt_attention_mask"] = text["prompt_attention_mask"] = cached(torch.arange(128).unsqueeze(0) < 64)
+            row["audio_duration"] = audio["duration"] = 1.5
+        for folder, value in (("latents", latent), ("conditions", text), ("audio_latents", audio)):
+            torch.save(value, cache / folder / f"{index}.pt")
+        rows.append(row)
+
+    output = tmp_path / "parquet"
+    save_parquet(str(cache), str(output), shard_size=shard_size, with_audio=True, pad_to_multiple_of=3)
+    shards = sorted(output.glob("*.parquet"))
+    expected_keys = set().union(*(row.keys() for row in rows))
+    for shard in shards:
+        assert set(Dataset.from_parquet(str(shard)).column_names) == expected_keys
+    exported = Dataset.from_parquet([str(shard) for shard in shards])
+    decoded = [process_dit_offline_example(row)[0] for row in exported]
+    assert len(decoded) == 3
+    for actual, expected in zip(decoded, [rows[0], rows[1], rows[0]]):
+        for key in expected_keys:
+            if isinstance(expected.get(key), torch.Tensor):
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+            else:
+                assert actual[key] == expected.get(key)
+
+    collated = DiTDataCollator()(decoded[:2])
+    processed = condition.process_condition(**collated)
+    assert processed["fps"] == [24.0, 18.0]
+    # Compare connectors with processing each source row on its own: the second
+    # row's mask must not migrate to the first when the first mask is absent.
+    for index, row in enumerate(decoded[:2]):
+        single = condition.process_condition(**DiTDataCollator()([row]))
+        for key in ("encoder_hidden_states", "audio_encoder_hidden_states", "context_mask"):
+            torch.testing.assert_close(processed[key][index], single[key][0], rtol=0, atol=0)
+    result = model(**processed)
+    assert torch.isfinite(result.loss["mse_loss"])
+    result.loss["mse_loss"].backward()
+    assert model.transformer_blocks[0].audio_ff.net[0].proj.weight.grad.norm() > 0
+
+
+def test_cache_optional_legacy_fields_keep_sample_positions():
+    """Legacy nested conditions keep missing masks/audio/reference slots in place."""
+    video = torch.randn(8, 3, 2, 2)
+    audio = torch.randn(2, 7, 4)
+    text = torch.randn(128, 32)
+    mask = torch.arange(128) < 64
+    result = LTXVideoConditionModel._unpack_raw_batch(
+        {
+            "conditions": [
+                {"video_prompt_embeds": text},
+                {"video_prompt_embeds": text, "audio_prompt_embeds": text, "prompt_attention_mask": mask},
+            ]
+        },
+        [video, video],
+        None,
+        None,
+        None,
+        [None, audio],
+        [None, video],
+        [None, 18.0],
+    )
+    for values in result[2:6]:
+        assert len(values) == 2 and values[0] is None
+    torch.testing.assert_close(result[2][1], mask.unsqueeze(0))
+    torch.testing.assert_close(result[3][1], text.unsqueeze(0))
+    torch.testing.assert_close(result[4][1], audio.unsqueeze(0))
+    torch.testing.assert_close(result[5][1], video.unsqueeze(0))
+
+
+@pytest.mark.parametrize("missing", ["audio_directory", "audio_latents", "audio_prompt_embeds", "disjoint"])
+def test_cache_rejects_incomplete_audio_before_writing(tmp_path, capsys, missing):
+    """AV readiness requires both audio fields on each row, not just nonzero totals."""
+    from veomni.models.diffusers.ltx2_3.ltx_condition.preprocess_dataset import save_parquet
+
+    cache = tmp_path / "cache"
+    for folder in ("latents", "conditions", "audio_latents"):
+        if folder != "audio_latents" or missing != "audio_directory":
+            (cache / folder).mkdir(parents=True)
+    for index in range(2):
+        torch.save({"latents": torch.zeros(8, 3, 2, 2)}, cache / "latents" / f"{index}.pt")
+        text = {"video_prompt_embeds": torch.zeros(128, 32)}
+        if not ((missing == "audio_prompt_embeds" and index == 1) or (missing == "disjoint" and index == 0)):
+            text["audio_prompt_embeds"] = torch.zeros(128, 32)
+        torch.save(text, cache / "conditions" / f"{index}.pt")
+        if missing != "audio_directory" and not (missing in ("audio_latents", "disjoint") and index == 1):
+            torch.save({"latents": torch.zeros(2, 7, 4)}, cache / "audio_latents" / f"{index}.pt")
+    output = tmp_path / "parquet"
+    with pytest.raises(ValueError, match="Audio latents directory|Incomplete audio-video cache rows"):
+        save_parquet(str(cache), str(output), shard_size=1, with_audio=True)
+    assert not list(output.glob("*.parquet"))
+    assert "READY" not in capsys.readouterr().out
+
+
+def test_cache_mixed_audio_microbatch_fails_before_processing():
+    """Reject a partial audio list instead of indexing audio against the wrong video."""
+    condition = object.__new__(LTXVideoConditionModel)
+    condition.config = LTXVideoConditionModelConfig(with_audio=True)
+    with pytest.raises(ValueError, match="separate LTX microbatches"):
+        condition.process_condition(
+            latents=[torch.zeros(1, 8, 3, 2, 2)] * 2,
+            context=[torch.zeros(1, 128, 32)] * 2,
+            audio_latents=[None, torch.zeros(1, 2, 7, 4)],
+        )
+
+
 def test_native_lora_update_save_reload(tmp_path):
     """Verify a native LoRA update survives adapter reload and weight merging."""
     base = tiny_model()

@@ -66,7 +66,8 @@ python -m veomni.models.diffusers.ltx2_3.ltx_condition.preprocess_dataset save-p
 
 Use a fresh cache directory when changing model versions or weights. Spatial sizes
 must be divisible by 32 and frame counts must be `8n + 1`. Set `--pad_to_multiple_of`
-to the intended data-parallel world size and check the packing summary for missing audio.
+to the intended data-parallel world size. With `--with_audio`, packing rejects
+rows missing audio latents or audio text features before writing shards.
 
 ## 3. Train and resume
 

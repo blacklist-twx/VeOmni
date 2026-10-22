@@ -91,7 +91,10 @@ python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py save-p
 ```
 
 Use `--with_audio` whenever the training config has audio enabled. Reference
-latents are included automatically when `reference_latents/` exists.
+latents are included automatically when `reference_latents/` exists. Packing
+rejects AV rows missing audio latents or audio text features. Optional fields
+retain their row positions across shards; video-only and AV samples must use
+separate microbatches.
 
 Output directory structure:
 

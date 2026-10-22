@@ -347,6 +347,27 @@ class LTXVideoConditionModel(PreTrainedModel):
                 )
             )
 
+        if not latents or context is None or len(latents) != len(context):
+            raise ValueError("LTX latents and context must have the same nonzero sample count.")
+        if any(value is None for value in latents + context):
+            raise ValueError("LTX video latents and text features are required for every sample.")
+        for name, values in (
+            ("context_mask", context_mask),
+            ("audio_context", audio_context),
+            ("audio_latents", audio_latents),
+            ("reference_latents", reference_latents),
+            ("fps", fps),
+        ):
+            if values is not None and len(values) != len(latents):
+                raise ValueError(f"LTX {name} must have one entry per sample, including missing optional entries.")
+        if self.config.with_audio and audio_latents is not None:
+            active_audio = [
+                value is not None and (reference_latents is None or reference_latents[i] is None)
+                for i, value in enumerate(audio_latents)
+            ]
+            if any(active_audio) and not all(active_audio):
+                raise ValueError("Mixed video-only and audio-video samples require separate LTX microbatches.")
+
         if first_frame_conditioning_p is None:
             first_frame_conditioning_p = self.config.first_frame_conditioning_p
         if timestep_sampling_mode is None:
@@ -486,7 +507,7 @@ class LTXVideoConditionModel(PreTrainedModel):
             packed_conditions["latents"].append(latents_on_device.to(device=device))
             packed_conditions["video_loss_mask"].append(video_loss_mask)
             packed_conditions["ref_seq_len"].append(ref_seq_len)
-            sample_fps = fps[i] if fps is not None else DEFAULT_FPS
+            sample_fps = fps[i] if fps is not None and fps[i] is not None else DEFAULT_FPS
             packed_conditions["fps"].append(sample_fps)
 
             if self.config.with_audio and sample_audio_latents is not None and sample_ref_latents is None:
@@ -534,106 +555,38 @@ class LTXVideoConditionModel(PreTrainedModel):
         """Unpack raw DiTDataCollator batch format into process_condition arguments."""
         device = torch.device(get_device_type())
 
+        def tensors(values, unbatched_ndim):
+            # Preserve every source-row slot, including absent optional fields.
+            if values is None:
+                return None
+            values = values if isinstance(values, list) else [values]
+            return [
+                None if value is None else (value.unsqueeze(0) if value.ndim == unbatched_ndim else value).to(device)
+                for value in values
+            ]
+
         if "video_prompt_embeds" in kwargs:
-            video_features = kwargs.pop("video_prompt_embeds")
-            audio_features = kwargs.pop("audio_prompt_embeds", None)
-            prompt_mask = kwargs.pop("prompt_attention_mask", None)
-            kwargs.pop("latents", None)
-            if fps is None and "fps" in kwargs:
-                fps = kwargs.pop("fps")
-
-            if latents is not None:
-                if isinstance(latents, list):
-                    latents = [
-                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 4 else t).to(device)
-                        for t in latents
-                    ]
-                else:
-                    latents = latents.to(device) if isinstance(latents, torch.Tensor) else latents
-
-            if isinstance(video_features, list):
-                context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
-            else:
-                context = [video_features.to(device)]
-
-            if audio_features is not None:
-                if isinstance(audio_features, list):
-                    audio_context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in audio_features]
-                else:
-                    audio_context = [audio_features.to(device)]
-
-            if prompt_mask is not None:
-                if isinstance(prompt_mask, list):
-                    context_mask = [(m.unsqueeze(0) if m.dim() == 1 else m).to(device) for m in prompt_mask]
-                else:
-                    context_mask = [prompt_mask.to(device)]
-
-            kwargs.pop("audio_latents", None)
-            if audio_latents is not None:
-                if isinstance(audio_latents, list):
-                    audio_latents = [
-                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 3 else t).to(device)
-                        for t in audio_latents
-                    ]
-                else:
-                    audio_latents = (
-                        audio_latents.to(device) if isinstance(audio_latents, torch.Tensor) else audio_latents
-                    )
-
-            kwargs.pop("reference_latents", None)
-            if reference_latents is not None:
-                if isinstance(reference_latents, list):
-                    reference_latents = [
-                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 4 else t).to(device)
-                        for t in reference_latents
-                    ]
-                else:
-                    reference_latents = (
-                        reference_latents.to(device)
-                        if isinstance(reference_latents, torch.Tensor)
-                        else reference_latents
-                    )
-
+            context = kwargs.pop("video_prompt_embeds")
+            audio_context = kwargs.pop("audio_prompt_embeds", audio_context)
+            context_mask = kwargs.pop("prompt_attention_mask", context_mask)
         elif "conditions" in kwargs:
-            conditions_raw = kwargs.pop("conditions")
-            audio_latents_raw = kwargs.pop("audio_latents", None)
-            if fps is None and "fps" in kwargs:
-                fps = kwargs.pop("fps")
+            conditions = kwargs.pop("conditions")
+            first = conditions[0]
+            if isinstance(first, dict) and "video_prompt_embeds" in first:
+                context = [sample["video_prompt_embeds"] for sample in conditions]
+                audio_context = [sample.get("audio_prompt_embeds") for sample in conditions]
+                context_mask = [sample.get("prompt_attention_mask") for sample in conditions]
+            elif isinstance(first, dict):
+                context = [sample.get("last_hidden_state", next(iter(sample.values()))) for sample in conditions]
+            else:
+                context = conditions
 
-            if latents is not None and isinstance(latents, list) and len(latents) > 0:
-                latents = [
-                    (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 4 else t).to(device) for t in latents
-                ]
-
-            first_cond = conditions_raw[0]
-            if isinstance(first_cond, dict) and "video_prompt_embeds" in first_cond:
-                video_features = [c["video_prompt_embeds"] for c in conditions_raw]
-                context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
-                audio_features_list = [c.get("audio_prompt_embeds") for c in conditions_raw]
-                if any(a is not None for a in audio_features_list):
-                    audio_context = [
-                        (f.unsqueeze(0) if f.dim() == 2 else f).to(device)
-                        for f in audio_features_list
-                        if f is not None
-                    ]
-                prompt_mask_list = [c.get("prompt_attention_mask") for c in conditions_raw]
-                if any(m is not None for m in prompt_mask_list):
-                    context_mask = [
-                        (m.unsqueeze(0) if m.dim() == 1 else m).to(device) for m in prompt_mask_list if m is not None
-                    ]
-            elif isinstance(first_cond, dict):
-                context = [
-                    c.get("last_hidden_state", next(iter(c.values()))).unsqueeze(0).to(device) for c in conditions_raw
-                ]
-            elif isinstance(first_cond, torch.Tensor):
-                context = [(c.unsqueeze(0) if c.dim() == 2 else c).to(device) for c in conditions_raw]
-
-            if audio_latents_raw is not None:
-                if isinstance(audio_latents_raw, list) and len(audio_latents_raw) > 0:
-                    audio_latents = [
-                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 3 else t).to(device)
-                        for t in audio_latents_raw
-                    ]
+        latents = tensors(latents, 4)
+        context = tensors(context, 2)
+        context_mask = tensors(context_mask, 1)
+        audio_context = tensors(audio_context, 2)
+        audio_latents = tensors(audio_latents, 3)
+        reference_latents = tensors(reference_latents, 4)
 
         return latents, context, context_mask, audio_context, audio_latents, reference_latents, fps
 

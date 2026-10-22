@@ -122,27 +122,34 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     return image_seqlens
 
 
-def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
-    if "latents" not in micro_batch:
-        return []
-    dit_latents_seqlens = []
-    for latents in micro_batch["latents"]:
-        latent_shape = latents.shape
-        if len(latent_shape) == 3:
-            B, seq_len, _C = latent_shape
-            dit_latents_seqlens.append(B * seq_len)
-            continue
-        if len(latent_shape) == 5:
-            B = latent_shape[0]
-        else:
-            B = 1
-        C, T, H, W = latent_shape[-4:]
-        T_out = int((T - 1) / 1 + 1)
-        H_out = int((H - 2) / 2 + 1)
-        W_out = int((W - 2) / 2 + 1)
-        seqlens = B * T_out * H_out * W_out
-        dit_latents_seqlens.append(seqlens)
-    return dit_latents_seqlens
+def _compute_dit_seqlens(micro_batch: Dict[str, List[Any]], config: "PretrainedConfig") -> List[Optional[int]]:
+    """Count collated samples even when their model's token layout is unavailable."""
+    sample_count = len(next(iter(micro_batch.values()), []))
+    seqlens = [None] * sample_count
+    model_type = getattr(config, "model_type", None)
+    if model_type == "MiniMaxH3DiTModel":
+        for i, packed in enumerate(micro_batch.get("packed", [])):
+            if not isinstance(packed, dict):
+                continue
+            positions = [packed.get(key) for key in ("text_pos", "img_pos", "audio_pos")]
+            if all(isinstance(pos, torch.Tensor) and pos.ndim == 1 for pos in positions):
+                seqlens[i] = sum(pos.numel() for pos in positions)
+    elif model_type == "WanTransformer3DModel":
+        patch_size = getattr(config, "patch_size", None)
+        if not isinstance(patch_size, (tuple, list)) or len(patch_size) != 3:
+            return seqlens
+        if not all(isinstance(p, int) and p > 0 for p in patch_size):
+            return seqlens
+        for i, latents in enumerate(micro_batch.get("latents", [])):
+            if not isinstance(latents, torch.Tensor) or latents.ndim not in (4, 5):
+                continue
+            if any(size % patch for size, patch in zip(latents.shape[-3:], patch_size)):
+                continue
+            length = latents.shape[0] if latents.ndim == 5 else 1
+            for size, patch in zip(latents.shape[-3:], patch_size):
+                length *= size // patch
+            seqlens[i] = length
+    return seqlens
 
 
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -226,6 +233,7 @@ class EnvironMeter:
         parallel_state: Optional["ParallelState"] = None,
     ) -> None:
         self.config = config
+        self.is_dit = getattr(config, "condition_model_type", None) is not None
         self.global_batch_size = global_batch_size
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
@@ -235,6 +243,9 @@ class EnvironMeter:
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
         self.consume_chunks = 0
+        self.consume_tokens_complete = True
+        self.batch_samples = 0
+        self.batch_unknown_seqlens = 0
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
@@ -264,6 +275,8 @@ class EnvironMeter:
 
     def state_dict(self) -> Dict[str, Any]:
         state_dict = {"consume_tokens": self.consume_tokens, "consume_chunks": self.consume_chunks}
+        if self.is_dit:
+            state_dict["consume_tokens_complete"] = self.consume_tokens_complete
         if self.enable_multisource:
             state_dict.update({"multisource_tracker": self.multisource_tracker.state_dict()})
 
@@ -272,11 +285,14 @@ class EnvironMeter:
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consume_tokens = state_dict["consume_tokens"]
         self.consume_chunks = state_dict["consume_chunks"]
+        if self.is_dit:
+            # Older meters silently omitted unsupported DiT layouts from their totals.
+            self.consume_tokens_complete = state_dict.get("consume_tokens_complete", False)
         if self.enable_multisource:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
-        if getattr(self.config, "condition_model_type", None) is None:  # hf model
+        if not self.is_dit:  # hf model
             if isinstance(micro_batch, List):
                 for sample in micro_batch:
                     self.batch_seqlens.extend(_compute_seqlens(sample))
@@ -289,7 +305,10 @@ class EnvironMeter:
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         else:  # dit diffusers model
-            self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
+            seqlens = _compute_dit_seqlens(micro_batch, self.config)
+            self.batch_samples += len(seqlens)
+            self.batch_unknown_seqlens += sum(length is None for length in seqlens)
+            self.batch_seqlens.extend(length for length in seqlens if length is not None)
 
     def step(
         self,
@@ -320,32 +339,54 @@ class EnvironMeter:
         )
         if lora_flops_unavailable:
             flops_achieved = 0
-        flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
-            (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
-            op="sum",
-            group=self.parallel_state.dp_group,
-        )
+        token_count_available = True
+        if self.is_dit:
+            flops_achieved, batch_tokens, real_global_batch_size, unknown_seqlens = all_reduce(
+                (flops_achieved, sum(self.batch_seqlens), self.batch_samples, self.batch_unknown_seqlens),
+                op="sum",
+                group=self.parallel_state.dp_group,
+            )
+            token_count_available = unknown_seqlens == 0
+            self.consume_tokens_complete &= token_count_available
+        else:
+            flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
+                (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
+                op="sum",
+                group=self.parallel_state.dp_group,
+            )
         flops_promised = flops_promised * self.world_size
         mfu = flops_achieved / flops_promised if flops_promised else 0
 
-        # calculate average effective len and tokens per second
-        avg_effective_len = batch_tokens / self.global_batch_size if self.global_batch_size else 0
-        avg_sample_seq_len = batch_tokens / real_global_batch_size if real_global_batch_size else 0
-        tokens_per_second = batch_tokens / delta_time
-        self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
-
-        metrics = {
-            "flops_achieved(T)": flops_achieved,
-            "flops_promised(T)": flops_promised,
-            "mfu": mfu,
-            "training/avg_effective_len": avg_effective_len,
-            "training/avg_sample_seq_len": avg_sample_seq_len,
-            "tokens_per_second(M)": tokens_per_second / 1e6,
-            "consume_tokens(M)": self.consume_tokens / 1e6,
-            "consume_tokens(B)": self.consume_tokens / 1e9,
-            "consumed_chunk_num": self.consume_chunks,
-        }
+        metrics = {"consumed_chunk_num": self.consume_chunks}
+        if token_count_available:
+            self.consume_tokens += batch_tokens
+            metrics.update(
+                {
+                    "flops_achieved(T)": flops_achieved,
+                    "flops_promised(T)": flops_promised,
+                    "mfu": mfu,
+                    "training/avg_effective_len": batch_tokens / self.global_batch_size
+                    if self.global_batch_size
+                    else 0,
+                    "training/avg_sample_seq_len": batch_tokens / real_global_batch_size
+                    if real_global_batch_size
+                    else 0,
+                    "tokens_per_second(M)": batch_tokens / delta_time / 1e6,
+                }
+            )
+        if self.consume_tokens_complete:
+            metrics.update(
+                {"consume_tokens(M)": self.consume_tokens / 1e6, "consume_tokens(B)": self.consume_tokens / 1e9}
+            )
+        if self.is_dit:
+            metrics.update(
+                {
+                    "samples_per_second": real_global_batch_size / delta_time,
+                    "token_count_available": int(token_count_available),
+                    "cumulative_token_count_available": int(self.consume_tokens_complete),
+                }
+            )
         metrics.update(compute_device_memory_metrics())
 
         if self.enable_multisource:
@@ -360,6 +401,8 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self.batch_samples = 0
+        self.batch_unknown_seqlens = 0
 
         return metrics
 

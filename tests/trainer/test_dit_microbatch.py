@@ -16,6 +16,7 @@ import veomni.data.data_loader as loader_module
 import veomni.models.model_runtime as runtime_module
 import veomni.trainer.base as base_module
 import veomni.trainer.dit_trainer as dit_module
+import veomni.utils.helper as helper_module
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.dataset import MappingDataset
 from veomni.trainer.base import BaseTrainer
@@ -32,6 +33,196 @@ from veomni.trainer.dit_trainer import (
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _meter(
+    monkeypatch,
+    model_type="MiniMaxH3DiTModel",
+    dp_size=1,
+    sp_size=1,
+    remote_unknown=0,
+    condition_model_type="condition",
+    **config,
+):
+    dp_group = object()
+    monkeypatch.setattr(helper_module.dist, "get_world_size", lambda: dp_size * sp_size)
+    monkeypatch.setattr(helper_module, "compute_device_memory_metrics", lambda: {})
+    counter = Mock()
+    counter.estimate_flops.return_value = (1.0, 2.0)
+    monkeypatch.setattr(helper_module, "VeomniFlopsCounter", lambda config: counter)
+
+    def reduce(values, *, op, group):
+        assert op == "sum"
+        assert group is dp_group
+        reduced = [value * dp_size for value in values]
+        if remote_unknown:
+            reduced[-1] += remote_unknown
+        return reduced
+
+    monkeypatch.setattr(helper_module, "all_reduce", reduce)
+    meter = helper_module.EnvironMeter(
+        config=SimpleNamespace(model_type=model_type, condition_model_type=condition_model_type, **config),
+        global_batch_size=4 * dp_size,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=dp_group),
+    )
+    return meter
+
+
+def _packed_sample(video_len=9, audio_len=3):
+    # The allocation includes padding, which is not a valid multimodal token.
+    return {
+        "packed": {
+            "text_pos": torch.arange(2),
+            "img_pos": torch.arange(video_len) + 2,
+            "audio_pos": torch.arange(audio_len) + video_len + 2,
+            "seq_len": 128,
+        }
+    }
+
+
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("dp_size,sp_size", [(1, 1), (2, 1), (2, 2)])
+def test_dit_meter_counts_samples_independently_of_tokens(monkeypatch, micro_batch_size, dp_size, sp_size):
+    meter = _meter(monkeypatch, dp_size=dp_size, sp_size=sp_size)
+    samples = [_packed_sample(video_len=i + 1) for i in range(4)]
+    for start in range(0, 4, micro_batch_size):
+        meter.add(DiTDataCollator()(samples[start : start + micro_batch_size]))
+    metrics = meter.step(delta_time=2.0, global_step=1)
+    expected_tokens = sum(2 + i + 1 + 3 for i in range(4)) * dp_size
+    assert metrics["consumed_chunk_num"] == 4 * dp_size
+    assert metrics["samples_per_second"] == 2 * dp_size
+    assert metrics["tokens_per_second(M)"] == expected_tokens / 2e6
+    assert metrics["training/avg_sample_seq_len"] == expected_tokens / (4 * dp_size)
+    assert metrics["token_count_available"] == 1
+
+
+@pytest.mark.parametrize("shape", [(8, 4, 6, 8), (1, 8, 4, 6, 8), (2, 8, 4, 6, 8)])
+@pytest.mark.parametrize("patch_size", [(1, 2, 2), (2, 3, 4)])
+def test_dit_meter_wan_uses_configured_patch_grid(monkeypatch, shape, patch_size):
+    meter = _meter(monkeypatch, model_type="WanTransformer3DModel", patch_size=patch_size)
+    meter.add(DiTDataCollator()([{"latents": torch.zeros(shape), "context": torch.ones(1, 5, 8)}]))
+    metrics = meter.step(delta_time=1.0, global_step=1)
+    batch = shape[0] if len(shape) == 5 else 1
+    expected = batch * (4 // patch_size[0]) * (6 // patch_size[1]) * (8 // patch_size[2])
+    assert metrics["consumed_chunk_num"] == 1  # Counts dataset rows, independent of a tensor's axes.
+    assert metrics["tokens_per_second(M)"] == expected / 1e6
+    assert metrics["consume_tokens(M)"] == expected / 1e6
+
+
+@pytest.mark.parametrize(
+    "model_type,sample,config",
+    [
+        ("WanTransformer3DModel", {"videos": ["raw-video"], "inputs": "caption"}, {"patch_size": (1, 2, 2)}),
+        ("MiniMaxH3DiTModel", {"input_latents": torch.zeros(1, 24, 2, 4, 4)}, {}),
+        ("MiniMaxH3DiTModel", {"packed": {"img_pos": torch.arange(9)}}, {}),
+        ("UnknownDiT", {"latents": torch.zeros(1, 8, 2, 4, 4)}, {"patch_size": (1, 2, 2)}),
+        ("WanTransformer3DModel", {"latents": torch.zeros(1, 9, 8)}, {"patch_size": (1, 2, 2)}),
+        ("WanTransformer3DModel", {"latents": torch.zeros(1, 8, 2, 3, 3)}, {"patch_size": (1, 2, 2)}),
+        ("WanTransformer3DModel", {"latents": torch.zeros(1, 8, 2, 4, 4)}, {}),
+    ],
+)
+def test_dit_meter_unknown_layout_counts_samples_without_inventing_tokens(monkeypatch, model_type, sample, config):
+    meter = _meter(monkeypatch, model_type=model_type, dp_size=2, sp_size=2, **config)
+    meter.add(DiTDataCollator()([sample, sample]))
+    metrics = meter.step(delta_time=0.5, global_step=1)
+    assert metrics == {
+        "consumed_chunk_num": 4,
+        "samples_per_second": 8,
+        "token_count_available": 0,
+        "cumulative_token_count_available": 0,
+    }
+
+
+@pytest.mark.parametrize("unknown_location", ["same_microbatch", "next_microbatch", "other_dp_rank"])
+def test_dit_meter_never_reports_partial_tokens(monkeypatch, unknown_location):
+    remote = unknown_location == "other_dp_rank"
+    meter = _meter(monkeypatch, dp_size=2 if remote else 1, sp_size=2, remote_unknown=int(remote))
+    known, unknown = _packed_sample(), {"inputs": "raw caption"}
+    if remote:
+        meter.add(DiTDataCollator()([known]))
+    elif unknown_location == "same_microbatch":
+        meter.add(DiTDataCollator()([known, unknown]))
+    else:
+        meter.add(DiTDataCollator()([known]))
+        meter.add(DiTDataCollator()([unknown]))
+    metrics = meter.step(delta_time=1.0, global_step=1)
+    assert metrics == {
+        "consumed_chunk_num": 2,
+        "samples_per_second": 2,
+        "token_count_available": 0,
+        "cumulative_token_count_available": 0,
+    }
+
+
+@pytest.mark.parametrize("first_known", [True, False])
+@pytest.mark.parametrize("resume", [True, False])
+def test_dit_meter_resets_step_counts_and_preserves_cumulative_completeness(monkeypatch, first_known, resume):
+    meter = _meter(monkeypatch, dp_size=2, sp_size=2)
+    first = _packed_sample(audio_len=0) if first_known else {"inputs": "raw caption"}
+    meter.add(DiTDataCollator()([first, first]))
+    meter.step(delta_time=1.0, global_step=1)
+    if resume:
+        state = meter.state_dict()
+        meter = _meter(monkeypatch, dp_size=2, sp_size=2)
+        meter.load_state_dict(state)
+    meter.add(DiTDataCollator()([_packed_sample()]))
+    metrics = meter.step(delta_time=2.0, global_step=2)
+    assert metrics["consumed_chunk_num"] == 6
+    assert metrics["samples_per_second"] == 1
+    assert metrics["tokens_per_second(M)"] == 14 / 1e6
+    assert metrics["token_count_available"] == 1
+    assert metrics["cumulative_token_count_available"] == int(first_known)
+    if first_known:
+        assert metrics["consume_tokens(M)"] == (11 * 4 + 14 * 2) / 1e6
+    else:
+        assert "consume_tokens(M)" not in metrics
+        assert "consume_tokens(B)" not in metrics
+
+
+def test_dit_meter_old_checkpoint_does_not_claim_complete_token_totals(monkeypatch):
+    meter = _meter(monkeypatch)
+    meter.load_state_dict({"consume_tokens": 100, "consume_chunks": 7})
+    meter.add(DiTDataCollator()([_packed_sample()]))
+    metrics = meter.step(delta_time=1.0, global_step=2)
+    assert metrics["consumed_chunk_num"] == 8
+    assert metrics["token_count_available"] == 1
+    assert metrics["cumulative_token_count_available"] == 0
+    assert "consume_tokens(M)" not in metrics
+
+
+def test_dit_meter_changes_preserve_text_metrics_and_checkpoint_schema(monkeypatch):
+    meter = _meter(monkeypatch, model_type="qwen3", condition_model_type=None, dp_size=2, sp_size=2)
+    meter.add({"cu_seq_lens_q": torch.tensor([0, 3, 8, 10]), "tail_padding_length": 2})
+    meter.add({"attention_mask": torch.tensor([[1, 1, 0]])})
+    metrics = meter.step(delta_time=2.0, global_step=1)
+    assert metrics["consumed_chunk_num"] == 6
+    assert metrics["tokens_per_second(M)"] == 10 / 1e6
+    assert metrics["consume_tokens(M)"] == 20 / 1e6
+    assert metrics["training/avg_effective_len"] == 2.5
+    assert metrics["training/avg_sample_seq_len"] == 20 / 6
+    assert metrics["flops_achieved(T)"] == 2.0
+    assert metrics["flops_promised(T)"] == 8.0
+    assert metrics["mfu"] == 0.25
+    assert "samples_per_second" not in metrics
+    assert "token_count_available" not in metrics
+    assert meter.state_dict() == {"consume_tokens": 20, "consume_chunks": 6}
+    restored = _meter(monkeypatch, model_type="qwen3", condition_model_type=None, dp_size=2, sp_size=2)
+    restored.load_state_dict(meter.state_dict())
+    restored.add({"attention_mask": torch.ones(1, 3)})
+    assert restored.step(delta_time=1.0, global_step=2)["consume_tokens(M)"] == 26 / 1e6
+
+
+def test_legacy_dit_meter_keeps_explicit_sample_count(monkeypatch):
+    from veomni.utils.dit_utils import EnvironMeter
+
+    meter = _meter(monkeypatch, model_type="WanTransformer3DModel", patch_size=(1, 2, 2))
+    monkeypatch.setattr(helper_module, "get_parallel_state", lambda: meter.parallel_state)
+    legacy = EnvironMeter(config=meter.config, global_batch_size=1, empty_cache_steps=0)
+    legacy.add({"latents": torch.zeros(1, 8, 2, 4, 4)}, model_type="wan")
+    metrics = legacy.step(delta_time=1.0, global_step=1)
+    assert metrics["consumed_chunk_num"] == 1
+    assert metrics["tokens_per_second(M)"] == 8 / 1e6
 
 
 def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=True):

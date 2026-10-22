@@ -107,6 +107,7 @@ class EnvironMeter(OriginalEnvironMeter):
             raise ValueError(f"model_type {model_type} not supported")
 
         self.batch_seqlens.extend(seqlens)
+        self.batch_samples += len(seqlens)
 
 
 def _get_shard_info(

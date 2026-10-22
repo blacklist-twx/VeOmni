@@ -43,6 +43,26 @@ Each scalar in `outputs.loss` must be a **sample mean** within the microbatch.
 Models must average per-sample losses, not all packed tokens, so longer samples
 do not receive more weight. The trainer then divides by `K` for accumulation.
 
+## Throughput metrics
+
+`consumed_chunk_num` counts dataset samples and `samples_per_second` reports
+sample throughput across the data-parallel group. Both include every sample in
+each microbatch and accumulation step; sequence-parallel replicas are not counted
+again. These metrics work for cached conditions and raw online inputs.
+
+Token metrics are model-specific: Wan counts latent video patches using its
+configured `patch_size`; H3 counts the text, image/video and audio positions in
+each cached `packed` layout, excluding padding. Raw inputs and other layouts have
+`token_count_available = 0`. If any sample on any DP rank has an unknown length,
+that step omits token throughput, average lengths and FLOP/MFU metrics instead of
+reporting partial totals. This change adds no FLOP/MFU formula.
+
+After an unknown-length step, cumulative token metrics stay unavailable
+(`cumulative_token_count_available = 0`), including after checkpoint resume.
+Later fully known steps can still report their own token throughput. Older
+checkpoints also mark cumulative tokens unavailable; their saved sample totals
+are retained, but previously missed samples cannot be reconstructed.
+
 ## Offline embedding
 
 `offline_embedding` runs only the condition model and writes one parquet row per

@@ -1442,3 +1442,202 @@ def test_audio_condition_augmentation_defaults_to_config():
     pk = row["packed"]
     actual = sample["unique_timesteps"][sample["inverse_indices"]][pk["audio_pos"][: pk["audio_cond_rows"]]]
     torch.testing.assert_close(actual, torch.full_like(actual, max(sample["t_audio"], 0.95)))
+
+
+@pytest.fixture
+def raw_reference_encoders(monkeypatch):
+    from veomni.models.diffusers.minimax_h3 import preprocessing
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder
+
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def encode_video(self, value, dtype, process_image=False):
+            t = 1 if process_image else 2
+            return torch.full((1, 24, t, value.shape[-2] // 16, value.shape[-1] // 16), value.mean(), dtype=dtype)
+
+    class AudioEncoder(torch.nn.Module):
+        sample_rate = 32000
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.lengths = []
+
+        def encode_audio(self, waveform, dtype):
+            self.lengths.append(waveform.shape[-1])
+            return torch.full((waveform.shape[0], 32, 2), waveform.mean(), dtype=dtype)
+
+    condition = condition_model()
+    condition.config.imgvid_cond_noise_aug = 1.0
+    condition._video_vae = VideoEncoder()
+    condition._audio_vae = AudioEncoder()
+    condition._text_encoder = torch.nn.Linear(1, 1).to(torch.bfloat16)
+    condition._tokenizer = object()
+    condition._processor = object()
+    presentations = []
+
+    def fake_encode(*args, ref_blocks, **kwargs):
+        presentations.append(ref_blocks)
+        return {"prompt_embeds": torch.ones(3, 32, dtype=torch.bfloat16), "text_token_tags": torch.tensor([1, 0, 1])}
+
+    monkeypatch.setattr(preprocessing, "encode_prompt", fake_encode)
+    monkeypatch.setattr(minimax_h3_text_encoder, "encode_prompt", fake_encode)
+    return condition, presentations
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_raw_ref2va_cache_roundtrip_and_training(raw_reference_encoders, tmp_path, with_audio):
+    from datasets import Dataset
+    from PIL import Image
+
+    from veomni.data.multimodal.dit.data_transform import process_dit_offline_example
+    from veomni.models.diffusers.minimax_h3.preprocessing import prepare_ref2va_sample
+    from veomni.trainer.dit_trainer import OfflineEmbeddingSaver
+
+    condition, presentations = raw_reference_encoders
+    frame = Image.new("RGB", (32, 32), (64, 64, 64))
+    refs = [
+        {"type": "audio", "audio": torch.full((1, 400), 3.0), "sample_rate": 32000},
+        {"type": "image", "image": Image.new("RGB", (64, 32), (128, 128, 128))},
+        {"type": "video_audio", "video": [frame] * 39, "audio": torch.full((2, 40000), 7.0), "sample_rate": 32000},
+        {"type": "image", "image": Image.new("RGB", (32, 64), (224, 224, 224))},
+    ]
+    sample = prepare_ref2va_sample(
+        condition,
+        prompt="A scene",
+        video=[frame] * 22,
+        references=refs,
+        audio=(torch.ones(1, 60000), 32000) if with_audio else None,
+        device="cpu",
+        ref_image_short_edge=32,
+        ref_video_short_edge=32,
+        ref_video_max_pixels=1024,
+        negative_prompt=" ",
+    )
+    assert sample["has_audio"] is with_audio
+    assert [b["kind"] for b in presentations[0]] == ["audio", "image", "video_audio", "image"]
+    assert presentations[0][1]["prepared_image"].size == (64, 32)
+    assert presentations[0][3]["prepared_image"].size == (32, 64)
+    assert len(presentations[0][2]["prepared_frames"]) == 22
+    assert presentations[1] is presentations[0]
+    assert len(refs[2]["video"]) == 39  # Source dictionaries remain reusable.
+    assert condition._audio_vae.lengths == ([29333] if with_audio else []) + [400, 29333]
+    assert sample["input_latents"].dtype == torch.bfloat16
+    assert sample["ref_visual_anchor"].shape == (6, 96)
+    torch.testing.assert_close(sample["ref_visual_anchor"][:2], torch.full((2, 96), 128 / 255, dtype=torch.bfloat16))
+    torch.testing.assert_close(sample["ref_visual_anchor"][-2:], torch.full((2, 96), 224 / 255, dtype=torch.bfloat16))
+    torch.testing.assert_close(sample["ref_audio_anchor"][:4], torch.full((4, 32), 3.0, dtype=torch.bfloat16))
+    torch.testing.assert_close(sample["ref_audio_anchor"][4:], torch.full((4, 32), 7.0, dtype=torch.bfloat16))
+    torch.testing.assert_close(sample["packed"]["token_tags"][:3], torch.tensor([1, 0, 1]))
+
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=1)
+    saver.save(sample)
+    saver.save_last()
+    stored = Dataset.from_parquet(str(next(tmp_path.glob("*.parquet"))))[0]
+    decoded = process_dit_offline_example(stored)[0]
+    assert decoded["packed"]["audio_cond_rows"] == 8
+    assert decoded["unconditional_packed"]["audio_cond_rows"] == 8
+    # CPU tiny DiT uses FP32; retain packed position IDs' native FP64 dtype.
+    for key, value in decoded.items():
+        if torch.is_tensor(value) and value.is_floating_point():
+            decoded[key] = value.float()
+    processed = prepare(condition, [decoded])[0]
+    model = tiny_model()
+    output = model(**processed)
+    loss = sum(output.loss.values())
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+    assert output.loss["mse_audio"] == 0 if not with_audio else output.loss["mse_audio"] > 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_raw_ref2va_video_decoder_stops_and_preserves_geometry(monkeypatch):
+    import imageio
+    import numpy as np
+
+    from veomni.models.diffusers.minimax_h3.preprocessing import read_video
+
+    class Reader:
+        decoded = 0
+        closed = False
+
+        def get_meta_data(self):
+            return {"fps": 48}
+
+        def iter_data(self):
+            for i in range(1000):
+                self.decoded += 1
+                yield np.full((32, 64, 3), i, dtype=np.uint8)
+
+        def close(self):
+            self.closed = True
+
+    reader = Reader()
+    monkeypatch.setattr(imageio, "get_reader", lambda path: reader)
+    frames = read_video("reference.mp4", 22)
+    assert len(frames) == 22
+    assert reader.decoded == 43
+    assert reader.closed
+    assert frames[0].size == (64, 32)
+    assert frames[-1].getpixel((0, 0)) == (42, 42, 42)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("frames,expected", [(5, "17n"), (23, "17n"), (22, "at least one")])
+def test_raw_ref2va_rejects_invalid_examples(raw_reference_encoders, frames, expected):
+    from PIL import Image
+
+    from veomni.models.diffusers.minimax_h3.preprocessing import prepare_ref2va_sample
+
+    condition, _ = raw_reference_encoders
+    with pytest.raises(ValueError, match=expected):
+        prepare_ref2va_sample(
+            condition, prompt="test", video=[Image.new("RGB", (32, 32))] * frames, references=[], device="cpu"
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_raw_ref2va_manifest_loader_preserves_reference_order(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from veomni.models.diffusers.minimax_h3 import preprocessing
+
+    Image.new("RGB", (64, 32)).save(tmp_path / "scene.png")
+    loaded = []
+
+    def video(path, limit):
+        loaded.append((path, limit))
+        return [Image.new("RGB", (96, 64))] * 22
+
+    monkeypatch.setattr(preprocessing, "read_video", video)
+    monkeypatch.setitem(sys.modules, "torchaudio", SimpleNamespace(load=lambda path: (torch.ones(1, 200), 32000)))
+    decoded = preprocessing.load_ref2va_record(
+        {
+            "prompt": "Scene",
+            "video": "target.mp4",
+            "audio": "target.wav",
+            "references": [
+                {"type": "audio", "audio": "voice.wav"},
+                {"type": "image", "image": "scene.png"},
+                {"type": "video", "video": "reference.mp4"},
+            ],
+        },
+        root=tmp_path,
+        num_frames=39,
+        height=32,
+        width=32,
+    )
+    assert loaded == [(tmp_path / "target.mp4", 39), (tmp_path / "reference.mp4", 22)]
+    assert all(frame.size == (32, 32) for frame in decoded["video"])
+    assert [ref["type"] for ref in decoded["references"]] == ["audio", "image", "video"]
+    assert decoded["references"][1]["image"].size == (64, 32)
+    assert decoded["references"][2]["video"][0].size == (96, 64)
+    assert decoded["audio"][1] == 32000

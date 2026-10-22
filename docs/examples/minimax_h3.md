@@ -233,6 +233,41 @@ every sample keeps weight `1/G`, as with `micro_batch_size=1`. Normalizing by th
 global audio-sample count is not implemented. Caches written without `has_audio`
 keep supervising audio as before.
 
+### Prepare Ref2VA caches from raw media
+
+The single-process [preprocessor](../../tasks/preprocess/minimax_h3_ref2va.py)
+loads the native H3 VAEs and Qwen encoder, without loading the DiT. Each JSONL
+line specifies one target and ordered references; paths are relative to the
+manifest. Audio tracks are explicit files, including video soundtracks:
+
+```json
+{"prompt":"A person walks through the scene.","video":"target.mp4","audio":"target.wav","references":[{"type":"image","image":"scene.png"},{"type":"audio","audio":"voice.wav"},{"type":"video_audio","video":"motion.mp4","audio":"motion.wav"}]}
+```
+
+```bash
+PYTHONPATH=. python tasks/preprocess/minimax_h3_ref2va.py \
+  --manifest data/train.jsonl --model-path /path/to/MiniMax-H3/Ref2VA \
+  --output output/h3_ref2va_cache --num-frames 73 --height 480 --width 832 \
+  --negative-prompt ' '
+```
+
+Videos are sampled at 24 fps and trimmed to `17n+5` frames (`n >= 1`). Targets
+are center-cropped to the requested size. References retain their aspect ratio
+with the native encoder's 32-pixel alignment; silent `video` references omit
+`audio`. Target audio and `video_audio` soundtracks are trimmed or zero-padded
+to their selected clip durations; standalone audio references keep their full
+duration. Omitting target `audio` disables its loss and retains reference audio.
+
+The output uses the existing `dit_offline` parquet format and can be consumed by
+[minimax_h3_ref2va_cfg_offline.yaml](../../configs/dit/minimax_h3_ref2va_cfg_offline.yaml):
+set `data.train_path` to the output directory and use matching Ref2VA weights.
+`--negative-prompt` additionally prepares the paired CFG condition; omit it and
+set `model.condition_model_cfg.training_cfg_scale=1.0` for ordinary SFT.
+Only trusted caches should be loaded, because the existing format uses pickle.
+Use an empty output directory. This entry point does not support distributed
+preprocessing or resume. The Python `prepare_ref2va_sample` API accepts already
+decoded frames/waveforms using the same native reference dictionaries.
+
 ### Ref2VA prepared data
 
 Use matching Ref2VA model weights and **precomputed** Ref2VA prompt/condition

@@ -92,6 +92,8 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
                     frames.append(img)
                     ptr += 1
                 last_raw_frame = raw_frame
+                if ptr == n_frames:
+                    break
             # Indices beyond the stream end clamp to the last decoded frame.
             while frames and ptr < n_frames:
                 img = PIL.Image.fromarray(last_raw_frame)

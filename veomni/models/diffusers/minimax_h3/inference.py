@@ -30,6 +30,8 @@ from einops import reduce, repeat
 from PIL import Image
 from tqdm import tqdm
 
+from veomni.lora import VeOmniLoraModel
+from veomni.lora.state_dict import get_lora_state_dict, insert_adapter_name, load_adapter_state_dict
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
 from veomni.ops.config import set_ops_config
 from veomni.utils.device import get_device_type
@@ -48,6 +50,34 @@ from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
 from .minimax_h3_core.packed_sequence import build_packed_fl2va, build_packed_ref2va, host_cu_seqlens
 from .minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from .minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
+
+
+def _load_inference_adapter(model: MiniMaxH3DiTModel, adapter_path: str) -> VeOmniLoraModel:
+    """Load a complete adapter onto the already materialized CPU DiT."""
+    # from_pretrained installs wrappers only; it does not restore their tensors.
+    model = VeOmniLoraModel.from_pretrained(model, adapter_path)
+    if not model.base_model.wrapped_dense:
+        raise ValueError("H3 adapter configuration does not target any DiT linear layers.")
+    expected = get_lora_state_dict(model, config=model.get_lora_config())
+    weights = load_adapter_state_dict(adapter_path, device="cpu")
+    missing = expected.keys() - weights.keys()
+    unexpected = weights.keys() - expected.keys()
+    if missing or unexpected:
+        raise ValueError(
+            f"H3 adapter weights do not match its configuration: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}."
+        )
+    for name, tensor in weights.items():
+        if tensor.shape != expected[name].shape:
+            raise ValueError(
+                f"H3 adapter shape mismatch for {name}: "
+                f"got {tuple(tensor.shape)}, expected {tuple(expected[name].shape)}."
+            )
+    # Only adapter tensors (and configured trainable biases) are present. The
+    # base weights have already been loaded by load_model_weights above.
+    model.load_state_dict({insert_adapter_name(k, model.active_adapter): v for k, v in weights.items()}, strict=False)
+    model.requires_grad_(False)
+    return model
 
 
 # ── Audio utils ──────────────────────────────────────────────────────
@@ -342,7 +372,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.scheduler = FlowMatchScheduler(shift=12.0)
         self.scheduler_audio = FlowMatchScheduler(shift=3.0)
         self.text_encoder: MiniMaxH3TextEncoder = None
-        self.dit: MiniMaxH3DiTModel = None
+        self.dit: MiniMaxH3DiTModel | VeOmniLoraModel = None
         self.video_vae: MiniMaxH3VideoVAE = None
         self.audio_vae: MiniMaxH3AudioVAE = None
         self.tokenizer = None
@@ -373,12 +403,15 @@ class MiniMaxH3Pipeline(BasePipeline):
         transformer_weights_path: str = None,
         transformer_config_kwargs: dict = None,
         ops_implementation=None,
+        adapter_path: str | None = None,
     ):
         """Load the pipeline from the staged condition and DiT classes.
 
         - condition model (text encoder + video/audio VAE + schedulers +
           tokenizer/processor) via MiniMaxH3ConditionModel.
         - DiT via MiniMaxH3DiTModel on meta, then load_model_weights on CPU.
+        - Optional single VeOmni-exported LoRA adapter directory. The adapter
+          stays unmerged and moves with its base layers during block offload.
         """
         if ops_implementation is not None:
             set_ops_config(ops_implementation)
@@ -431,6 +464,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch.bfloat16)
         load_model_weights(pipe.dit, transformer_weights_path, init_device="cpu")
+        if adapter_path is not None:
+            pipe.dit = _load_inference_adapter(pipe.dit, adapter_path)
         pipe.dit.dit.enable_block_offload()
         pipe.dit._self_managed = True
         pipe.dit.eval()

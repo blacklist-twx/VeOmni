@@ -19,6 +19,8 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     },
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
+    # Optional VeOmni LoRA export trained against this same base model:
+    # adapter_path="checkpoints/global_step_25/lora_ckpt",
     ops_implementation=OpsImplementationConfig(
         attn_implementation="flash_attention_2",
         rotary_pos_emb_implementation="eager",

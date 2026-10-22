@@ -583,6 +583,136 @@ def test_cfg_recipe_native_lora_and_condition_config_roundtrip():
     assert any(p.grad.abs().sum() > 0 for _, p in trainable)
 
 
+def h3_pipeline_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    base = tiny_model().to(torch.bfloat16)
+    transformer = tmp_path / "transformer"
+    base.config.save_pretrained(transformer)
+    # Published H3 checkpoints use raw DiT keys; the weight loader adds `dit.`.
+    save_file(base.dit.state_dict(), transformer / "model.safetensors")
+    condition_model().config.save_pretrained(tmp_path / "condition")
+    kwargs = dict(
+        device="cpu",
+        torch_dtype=torch.bfloat16,
+        condition_model_path=str(tmp_path / "condition"),
+        condition_model_cfg={"skip_encoder_load": True},
+        transformer_config_path=str(transformer),
+        transformer_weights_path=str(transformer),
+    )
+    return base, kwargs
+
+
+@pytest.mark.parametrize("bias", ["none", "lora_only", "all"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_training_adapter_loads_in_native_pipeline(tmp_path, monkeypatch, bias):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.diffusers.minimax_h3.inference import MiniMaxH3Pipeline, model_fn_minimax_h3
+
+    torch.manual_seed(7)
+    base, kwargs = h3_pipeline_checkpoint(tmp_path)
+    model = VeOmniLoraModel(
+        base, VeOmniLoraConfig(r=2, lora_alpha=2, target_modules=["qkv_proj", "out_proj"], bias=bias)
+    )
+    row = audio_ref_raw(audio_only=False)
+    row = {
+        key: value.bfloat16() if torch.is_tensor(value) and value.is_floating_point() else value
+        for key, value in row.items()
+    }
+    inference_inputs = dict(
+        video_latents=row["input_latents"],
+        audio_latents=row["audio_input_latents"],
+        packed=row["packed"],
+        prompt_embeds=row["prompt_embeds"],
+        t_video=0.4,
+        t_audio=0.5,
+        ref_visual_anchor=row["ref_visual_anchor"],
+        ref_audio_anchor=row["ref_audio_anchor"],
+    )
+    with torch.no_grad():
+        original = model_fn_minimax_h3(model, **inference_inputs)
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.05)
+    loss = sum(model(**prepare(condition_model(), [row])[0]).loss.values())
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+    optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        expected = model_fn_minimax_h3(model, **inference_inputs)
+    assert any(not torch.equal(before, after) for before, after in zip(original, expected))
+    adapter = tmp_path / "adapter"
+    model.save_pretrained(adapter)
+
+    pipe = MiniMaxH3Pipeline.from_pretrained(**kwargs, adapter_path=str(adapter))
+    assert isinstance(pipe.dit, VeOmniLoraModel)
+    assert pipe.dit.dit._block_offload_enabled
+    assert pipe.dit._self_managed
+    assert not pipe.dit.training
+    assert not any(p.requires_grad for p in pipe.dit.parameters())
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(pipe.dit.state_dict()[name], tensor, rtol=0, atol=0)
+    # Encoder staging must leave the self-managed DiT and its adapter alone.
+    monkeypatch.setattr(pipe.dit, "to", lambda *args, **kwargs: pytest.fail("DiT staged outside block offload"))
+    pipe.load_models_to_device(["dit"])
+    with torch.no_grad():
+        actual = pipe.model_fn(pipe.dit, **inference_inputs)
+    for actual_prediction, expected_prediction in zip(actual, expected):
+        torch.testing.assert_close(actual_prediction, expected_prediction, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_pipeline_without_adapter_preserves_base_weights(tmp_path):
+    from veomni.lora import VeOmniLoraModel
+    from veomni.models.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
+
+    base, kwargs = h3_pipeline_checkpoint(tmp_path)
+    pipe = MiniMaxH3Pipeline.from_pretrained(**kwargs)
+    assert not isinstance(pipe.dit, VeOmniLoraModel)
+    assert pipe.dit.dit._block_offload_enabled
+    assert pipe.dit._self_managed
+    for name, tensor in base.state_dict().items():
+        torch.testing.assert_close(pipe.dit.state_dict()[name], tensor, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("error", ["missing", "unexpected", "shape", "no_targets", "no_weights"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_pipeline_rejects_incompatible_adapter(tmp_path, error):
+    from safetensors.torch import load_file, save_file
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
+
+    base, kwargs = h3_pipeline_checkpoint(tmp_path)
+    config = VeOmniLoraConfig(r=2, lora_alpha=2, target_modules=["qkv_proj"])
+    adapter = tmp_path / "adapter"
+    VeOmniLoraModel(base, config).save_pretrained(adapter)
+    path = adapter / "adapter_model.safetensors"
+    weights = load_file(path)
+    if error == "missing":
+        weights.pop(next(iter(weights)))
+    elif error == "unexpected":
+        weights["base_model.model.dit.video_patch_proj.weight"] = base.dit.video_patch_proj.weight.detach().clone()
+    elif error == "shape":
+        name = next(iter(weights))
+        weights[name] = weights[name][:1]  # Broadcastable shapes must also fail.
+    elif error == "no_targets":
+        config.replace(target_modules=["not_an_h3_layer"]).save_pretrained(adapter)
+    if error == "no_weights":
+        path.unlink()
+    else:
+        save_file(weights, path)
+    match = {
+        "missing": "missing=",
+        "unexpected": "unexpected=",
+        "shape": "shape mismatch",
+        "no_targets": "does not target",
+        "no_weights": "No adapter_model",
+    }[error]
+    with pytest.raises(FileNotFoundError if error == "no_weights" else ValueError, match=match):
+        MiniMaxH3Pipeline.from_pretrained(**kwargs, adapter_path=str(adapter))
+
+
 def serial(model, samples):
     return [model(**sample) for sample in samples]
 

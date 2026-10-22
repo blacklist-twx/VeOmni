@@ -284,8 +284,8 @@ computes loss only on target video/audio. `has_audio=False` masks target audio
 loss without removing reference audio.
 
 The existing native reference encoder supports raw audio and video soundtracks.
-A cache producer can reuse its [`MiniMaxH3Unit_ReferenceEncoder.process()`](../../veomni/models/diffusers/minimax_h3/inference.py#L844) with a
-loaded H3 pipeline, then [`MiniMaxH3Unit_PromptEmbedder.process()`](../../veomni/models/diffusers/minimax_h3/inference.py#L605) with the returned
+A cache producer can reuse its [`MiniMaxH3Unit_ReferenceEncoder.process()`](../../veomni/models/diffusers/minimax_h3/inference.py#L879) with a
+loaded H3 pipeline, then [`MiniMaxH3Unit_PromptEmbedder.process()`](../../veomni/models/diffusers/minimax_h3/inference.py#L640) with the returned
 `ref_blocks`, and build the metadata above. An audio input is
 `{"type": "audio", "audio": waveform, "sample_rate": sample_rate}`; a
 `video_audio` input additionally has `"video": frames`. The native encoder
@@ -379,6 +379,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     },
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
+    # Optional: adapter_path="checkpoints/global_step_25/lora_ckpt",
     ops_implementation=OpsImplementationConfig(
         attn_implementation="flash_attention_2",
         rotary_pos_emb_implementation="eager",
@@ -390,6 +391,14 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     ),
 )
 ```
+
+To load a trained LoRA, enable `train.checkpoint.save_hf_weights: true` during
+training and set `adapter_path` to the exported `global_step_<N>/lora_ckpt` directory
+containing `adapter_config.json` and `adapter_model.safetensors`. Keep the same
+base checkpoint and condition-model variant used for training (FL2VA or Ref2VA).
+The pipeline loads one VeOmni-exported adapter, validates its keys and shapes,
+and keeps it unmerged with block offload enabled. Omit `adapter_path` for base
+model inference; a distributed training-state directory is not an adapter export.
 
 Call parameters:
 

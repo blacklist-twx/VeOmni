@@ -13,15 +13,12 @@
 # limitations under the License.
 
 import math
-import os
-import pickle as pk
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
@@ -41,70 +38,12 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
+from ..utils.dist_utils import raise_if_any_rank_failed
 from .base import BaseTrainer, VeOmniIter
+from .dit_offline_embedding import DiTOfflineEmbeddingCallback, OfflineEmbeddingSaver
 
 
 logger = helper.create_logger(__name__)
-
-
-class OfflineEmbeddingSaver:
-    def __init__(self, save_path: str, dataset_length: int = 0, shard_num: int = 1, max_shard=1000):
-        from ..distributed.parallel_state import get_parallel_state
-
-        self.dp_rank = get_parallel_state().dp_rank
-        dp_size = get_parallel_state().dp_size
-        if dp_size * shard_num > max_shard:
-            shard_num = max_shard // dp_size
-            logger.info_rank0(f"shard_num * dp_size must be smaller than max_shard, set shard_num = {shard_num}")
-        self.shard_num = shard_num
-        self.max_shard = max_shard
-        self.index = 0
-        self.buffer = []
-
-        self.save_path = save_path
-        self.dataset_length = dataset_length
-        self.batch_len = math.ceil(dataset_length / self.shard_num)
-        logger.info(f"Rank [{self.dp_rank}] save to [{self.save_path}] each batch_len [{self.batch_len}].")
-        os.makedirs(self.save_path, exist_ok=True)
-        self.rest_len = self.dataset_length
-
-    @staticmethod
-    def _cpu_recursive(obj):
-        """Move tensors to CPU recursively, leave other types unchanged."""
-        if isinstance(obj, torch.Tensor):
-            return obj.cpu()
-        if isinstance(obj, dict):
-            return {k: OfflineEmbeddingSaver._cpu_recursive(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return type(obj)(OfflineEmbeddingSaver._cpu_recursive(v) for v in obj)
-        return obj
-
-    def to_save_bytes(self, save_item: Dict[str, torch.Tensor]):
-        converted_dict = {}
-        for key in list(save_item.keys()):
-            converted_dict[key] = pk.dumps(self._cpu_recursive(save_item[key]))
-            del save_item[key]
-        return converted_dict
-
-    def _append_item(self, save_item: Dict[str, torch.Tensor]):
-        if self.rest_len > 0:  # 多余的dummy data buffer 不保存
-            self.buffer.append(self.to_save_bytes(save_item))
-            self.rest_len -= 1
-
-    def save(self, save_item):
-        self._append_item(save_item)
-        if len(self.buffer) >= self.batch_len:
-            ds = Dataset.from_list(self.buffer)
-            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
-            self.buffer = []
-            self.index += 1
-
-    def save_last(self):
-        if len(self.buffer) > 0:
-            ds = Dataset.from_list(self.buffer)
-            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
-            self.buffer = []
-            self.index += 1
 
 
 @dataclass
@@ -341,6 +280,12 @@ class DiTTrainer:
             self.base._build_training_context(self.base.model)
 
         self.base._init_callbacks()
+        if self.training_task == "offline_embedding":
+            self.base.saves_model_state = False
+            self.base.offline_cache_writer = self.offline_embedding_saver
+            callback = DiTOfflineEmbeddingCallback(self.base)
+            self.base._callbacks[self.base._callbacks.index(self.base.global_state_callback)] = callback
+            self.base.global_state_callback = callback
 
     @property
     def condition_model(self) -> PreTrainedModel:
@@ -365,6 +310,13 @@ class DiTTrainer:
             else:
                 self.offline_embedding_save_dir = args.data.offline_embedding_save_dir
 
+            if args.train.checkpoint.save_steps or args.train.checkpoint.load_path:
+                if args.data.dataloader.type != "native" or not args.data.dataloader.in_order:
+                    raise ValueError("DiT cache resume requires the native dataloader with in_order=True.")
+                if args.data.dataloader.use_background_prefetcher:
+                    raise ValueError("DiT cache resume requires use_background_prefetcher=False.")
+                if args.data.dataloader.num_workers != 0:
+                    raise ValueError("DiT cache resume requires num_workers=0 to preserve random preprocessing.")
             args.data.dataloader.drop_last = False
             args.data.dataloader.shuffle = False
             args.train.checkpoint.save_epochs = 0
@@ -409,6 +361,16 @@ class DiTTrainer:
                 self.offline_embedding_saver = OfflineEmbeddingSaver(
                     save_path=self.offline_embedding_save_dir,
                     dataset_length=valid_data_length,
+                    identity={
+                        "data": asdict(args.data),
+                        "model": asdict(args.model),
+                        "dataset_fingerprint": getattr(self.base.train_dataset._data, "_fingerprint", None),
+                        "source_length": dataset_len,
+                        "seed": args.train.seed,
+                        "micro_batch_size": args.train.micro_batch_size,
+                        "world_size": args.train.world_size,
+                        "sp_size": get_parallel_state().sp_size,
+                    },
                 )
                 padded_len = (
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
@@ -465,11 +427,26 @@ class DiTTrainer:
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )
+            if self.training_task == "offline_embedding":
+                # Iterator reconstruction must not consume the encoder's default torch RNG.
+                self.base.train_dataloader.generator = torch.Generator().manual_seed(
+                    args.train.seed + get_parallel_state().dp_rank
+                )
         else:
             self.base.train_dataloader = None
 
     def on_train_begin(self):
         self.base.on_train_begin()
+        if self.training_task == "offline_embedding":
+            error = None
+            try:
+                if self.offline_embedding_saver is not None:
+                    self.offline_embedding_saver.open()
+            except Exception as exc:  # noqa: BLE001 - propagate to every rank before proceeding
+                error = exc
+            raise_if_any_rank_failed(error, "opening the DiT offline cache")
+            if dist.is_initialized():
+                dist.barrier()
 
     def on_train_end(self):
         self.base.on_train_end()
@@ -654,7 +631,20 @@ class DiTTrainer:
 
         synchronize()
 
-        if self.training_task == "offline_embedding" and self.offline_embedding_saver is not None:
-            self.offline_embedding_saver.save_last()
+        if self.training_task == "offline_embedding":
+            error = None
+            try:
+                if self.offline_embedding_saver is not None:
+                    self.offline_embedding_saver.finalize(mark_complete=False)
+            except Exception as exc:  # noqa: BLE001 - finish or fail collectively
+                error = exc
+            raise_if_any_rank_failed(error, "finalizing the DiT offline cache")
+            error = None
+            try:
+                if args.train.global_rank == 0:
+                    self.offline_embedding_saver.complete_path.touch()
+            except Exception as exc:  # noqa: BLE001 - publish completion only after every rank flushed
+                error = exc
+            raise_if_any_rank_failed(error, "marking the DiT offline cache complete")
 
         self.base.destroy_distributed()

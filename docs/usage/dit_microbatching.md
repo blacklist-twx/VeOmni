@@ -54,6 +54,47 @@ encoder and host-memory budget. Embedding disables sampler shuffling and pads
 only an index view of the source dataset; the saver discards trailing repeats
 so each original sample is written once.
 
+### Resuming embedding
+
+Use the existing checkpoint options to save the cache position together with
+its dataloader cursor. Each checkpoint flushes buffered rows to atomic parquet
+shards before committing the cursor; it does not save model weights.
+
+```yaml
+data:
+  offline_embedding_save_dir: /shared/cache/my_dataset
+  dataloader:
+    num_workers: 0
+    in_order: true
+    use_background_prefetcher: false
+train:
+  training_task: offline_embedding
+  checkpoint:
+    output_dir: /shared/runs/my_embedding
+    save_steps: 100
+    # On restart, set the complete step directory returned by this run:
+    # load_path: /shared/runs/my_embedding/checkpoints/global_step_100
+```
+
+Resume with the same source dataset, condition-model configuration, batch size,
+worker configuration and parallel topology. Resumable runs require the native
+dataloader with `num_workers: 0`, `in_order: true` and
+`use_background_prefetcher: false`, so random preprocessing runs in the
+checkpointed process. Worker random streams are not restored by the current
+dataloader cursor. The dataset fingerprint and resolved
+configuration are checked. Keep referenced media and model weights immutable;
+their contents are not rehashed. The output directory and checkpoint directory
+must be on shared storage with atomic file replacement, and only one job may
+write to them at a time.
+
+Restart restores the dataloader cursor and encoder RNG, verifies committed
+shards, and removes only shards written after that checkpoint. Those uncommitted
+samples are encoded again. Missing cursor files, incomplete checkpoints, changed
+configuration and missing or corrupt committed shards fail explicitly. A fresh
+run refuses existing parquet output; a completed cache cannot be resumed.
+Without `save_steps`, embedding keeps its existing one-pass behavior and no
+restart checkpoint is created. Use only the final cache as training input.
+
 ## Model ownership
 
 Packing, valid-token selection, multimodal layouts, attention boundaries,

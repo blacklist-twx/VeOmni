@@ -629,6 +629,76 @@ def test_native_foundation_loader_uses_ordinary_batch_contract(backend):
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+@pytest.mark.parametrize("timestep_id", [0, 15])
+@pytest.mark.parametrize("cached", ["missing", None, 0.3])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_cached_visual_noise_sets_reference_timesteps(monkeypatch, task, timestep_id, cached):
+    condition = condition_model()
+    condition.config.imgvid_cond_noise_aug = 0.4
+    raw = raw_sample(task=task)
+    if cached != "missing":
+        raw["imgvid_cond_noise_aug"] = cached
+    monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor([timestep_id]))
+
+    sample = prepare(condition, [raw])[0]
+    times = sample["unique_timesteps"][sample["inverse_indices"]]
+    positions = raw["packed"]["img_pos"]
+    cond_rows = raw["packed"]["cond_rows"]
+    augmentation = cached if isinstance(cached, float) else condition.config.imgvid_cond_noise_aug
+    assert (sample["t_video"] > augmentation) == (timestep_id == 15)
+    torch.testing.assert_close(
+        times[positions[:cond_rows]], torch.full((cond_rows,), max(sample["t_video"], augmentation))
+    )
+    torch.testing.assert_close(
+        times[positions[cond_rows:]], torch.full((len(positions) - cond_rows,), sample["t_video"])
+    )
+    anchor_key = "ref_visual_anchor" if task == "ref2va" else "keyframe_cond_anchor"
+    torch.testing.assert_close(sample["x"][0, positions[:cond_rows]], raw[anchor_key])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("cached", [-0.1, 1.1, float("nan"), float("inf"), 0.0, 1.0])
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_cached_visual_noise_validates_conditioned_samples(monkeypatch, cached, task):
+    raw = raw_sample(task=task)
+    raw["imgvid_cond_noise_aug"] = cached
+    monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor([0]))
+    if not 0.0 <= cached <= 1.0:
+        with pytest.raises(ValueError, match="imgvid_cond_noise_aug must be finite"):
+            prepare(condition_model(), [raw])
+    else:
+        sample = prepare(condition_model(), [raw])[0]
+        times = sample["unique_timesteps"][sample["inverse_indices"]]
+        positions = raw["packed"]["img_pos"][: raw["packed"]["cond_rows"]]
+        torch.testing.assert_close(times[positions], torch.full((len(positions),), cached))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_unused_visual_noise_does_not_reject_unconditioned_samples():
+    raw = raw_sample(keyframes=())
+    raw["imgvid_cond_noise_aug"] = float("nan")
+    sample = prepare(condition_model(), [raw])[0]
+    assert sample["cond_rows"] == 0
+    assert torch.isfinite(sample["unique_timesteps"]).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_mixed_cached_visual_noise_is_sample_local(monkeypatch):
+    condition = condition_model()
+    condition.config.imgvid_cond_noise_aug = 0.8
+    raws = [raw_sample(task=task) for task in ("fl2va", "ref2va", "fl2va", "ref2va")]
+    raws[0]["imgvid_cond_noise_aug"] = 0.3
+    raws[1]["imgvid_cond_noise_aug"] = 0.6
+    raws[2]["imgvid_cond_noise_aug"] = None
+    monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: torch.tensor([0]))
+    samples = prepare(condition, raws)
+    for sample, raw, expected in zip(samples, raws, (0.3, 0.6, 0.8, 0.8)):
+        times = sample["unique_timesteps"][sample["inverse_indices"]]
+        positions = raw["packed"]["img_pos"][: raw["packed"]["cond_rows"]]
+        torch.testing.assert_close(times[positions], torch.full((len(positions),), expected))
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 def test_preparation_preserves_single_sample_rng_and_weights(task):
     cond = condition_model()
     raws = [raw_sample(3, task), raw_sample(7, task)]

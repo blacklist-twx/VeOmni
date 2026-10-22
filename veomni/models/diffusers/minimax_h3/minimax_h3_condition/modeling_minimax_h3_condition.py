@@ -539,7 +539,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         prompt_embeds: list[torch.Tensor],
         packed: list[dict],
         keyframe_cond_anchor: list[torch.Tensor | None] | None = None,
-        imgvid_cond_noise_aug: float = 0.999,
+        imgvid_cond_noise_aug: float | None = None,
         audio_cond_noise_aug: float | None = None,
         ref_visual_anchor: list[torch.Tensor | None] | None = None,
         ref_audio_anchor: list[torch.Tensor | None] | None = None,
@@ -564,6 +564,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         # single-element lists.
         if isinstance(imgvid_cond_noise_aug, list):
             imgvid_cond_noise_aug = imgvid_cond_noise_aug[0]
+        if imgvid_cond_noise_aug is None:
+            imgvid_cond_noise_aug = self.config.imgvid_cond_noise_aug
         if isinstance(audio_cond_noise_aug, list):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
         if audio_cond_noise_aug is None:
@@ -657,8 +659,10 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         if audio_cond_rows:
             timesteps[audio_pos[:audio_cond_rows]] = max(float(t_audio), float(audio_cond_noise_aug))
         if cond_rows > 0:
-            # Condition tokens: always near-clean (t ≈ 1.0, sigma ≈ 0)
-            timesteps[img_pos[:cond_rows]] = max(float(t_video), float(cfg.imgvid_cond_noise_aug))
+            if not 0.0 <= float(imgvid_cond_noise_aug) <= 1.0:
+                raise ValueError("imgvid_cond_noise_aug must be finite and in [0, 1].")
+            # Match the noise augmentation used when preparing the cached anchors.
+            timesteps[img_pos[:cond_rows]] = max(float(t_video), float(imgvid_cond_noise_aug))
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
 
         # 6. Shape info for unpatchify (use keys NOT popped by trainer)

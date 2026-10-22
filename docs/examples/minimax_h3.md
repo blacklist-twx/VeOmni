@@ -263,9 +263,11 @@ packed = build_packed_ref2va(
 
 Store this `packed` dictionary and `ref_visual_anchor` of shape
 `[packed["cond_rows"], 96]` in the existing offline-record format. Anchor rows must
-be concatenated in reference-block order and already use the same conditioning
-noise augmentation as `model.condition_model_cfg.imgvid_cond_noise_aug`, matching
-the native inference reference encoder. Preserve the Ref2VA presentation's text
+be concatenated in reference-block order and already include their conditioning
+noise augmentation, matching the native inference reference encoder. Store its
+value as `imgvid_cond_noise_aug` in each cache record; missing or `None` values
+fall back to `model.condition_model_cfg.imgvid_cond_noise_aug`. This also applies
+to FL2VA keyframe caches. Preserve the Ref2VA presentation's text
 versus vision token tags. Do not substitute target-video keyframes or FL2VA prompt
 embeddings for Ref2VA references.
 

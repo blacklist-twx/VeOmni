@@ -35,6 +35,7 @@ from ..data.data_collator import DataCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..ops.config import set_ops_config
 from ..utils import helper
 from ..utils.device import (
@@ -537,7 +538,11 @@ class DiTTrainer:
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
 
-        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
+        with (
+            use_parallel_state(self.base.model.parallel_state),
+            self.base.model_fwd_context,
+            set_batch_invariant_mode(self.base.args.train.enable_batch_invariant_mode),
+        ):
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
@@ -545,7 +550,11 @@ class DiTTrainer:
         # DiT postforward does not read ambient ParallelState.
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
+        with (
+            use_parallel_state(self.base.model.parallel_state),
+            self.base.model_bwd_context,
+            set_batch_invariant_mode(self.base.args.train.enable_batch_invariant_mode),
+        ):
             loss.backward()
 
         del micro_batch

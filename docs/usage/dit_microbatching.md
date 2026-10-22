@@ -43,6 +43,13 @@ Each scalar in `outputs.loss` must be a **sample mean** within the microbatch.
 Models must average per-sample losses, not all packed tokens, so longer samples
 do not receive more weight. The trainer then divides by `K` for accumulation.
 
+`train.enable_batch_invariant_mode: true` applies the existing CUDA ATen patch
+around the DiT forward and backward, including activation-checkpoint
+recomputation. It defaults to `false`; frozen condition encoding and offline
+embedding do not enter this scope. The previous mode is restored on exit or
+failure. This option does not make every attention or distributed kernel
+batch-invariant; validate the selected model and backend separately.
+
 ## Offline embedding
 
 `offline_embedding` runs only the condition model and writes one parquet row per

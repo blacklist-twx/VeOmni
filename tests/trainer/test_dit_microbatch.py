@@ -263,3 +263,81 @@ def test_collator_aligns_missing_keys_with_none():
     assert dict(single) == {"a": [1], "b": [2]}
     mixed = DiTDataCollator()([{"a": 1, "x": "fl2va"}, {"a": 2, "y": "ref2va"}, {"a": 3}])
     assert dict(mixed) == {"a": [1, 2, 3], "x": ["fl2va", None, None], "y": [None, "ref2va", None]}
+
+
+@pytest.fixture
+def invariant_mode_on_cpu(monkeypatch):
+    from veomni.ops.batch_invariant import patch
+
+    # Exercise the real context lifecycle without installing CUDA kernels on CPU.
+    monkeypatch.setattr(patch, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(patch, "_batch_invariant_lib", None)
+    monkeypatch.setattr(patch, "enable_batch_invariant_mode", lambda: setattr(patch, "_batch_invariant_lib", True))
+    monkeypatch.setattr(patch, "disable_batch_invariant_mode", lambda: setattr(patch, "_batch_invariant_lib", None))
+    return patch
+
+
+@pytest.mark.parametrize("task", ["offline_training", "online_training"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_dit_invariant_mode_covers_forward_backward_and_recompute(
+    monkeypatch, invariant_mode_on_cpu, task, enabled, checkpointed
+):
+    from torch.utils.checkpoint import checkpoint
+
+    patch = invariant_mode_on_cpu
+    seen = []
+
+    class Model(_Model):
+        def forward(self, *, value):
+            def compute(x):
+                seen.append(("forward", patch.is_batch_invariant_mode_enabled()))
+                return (x * self.weight).sin()
+
+            result = checkpoint(compute, value[0], use_reentrant=False) if checkpointed else compute(value[0])
+            return ModelOutput(loss={"mse": result.square().mean()})
+
+    trainer = _trainer(monkeypatch, task, 1)
+    trainer.base.args.train.enable_batch_invariant_mode = enabled
+    model = Model()
+    model.weight.register_hook(lambda grad: seen.append(("backward", patch.is_batch_invariant_mode_enabled())))
+    runtime = DiTModelRuntime.__new__(DiTModelRuntime)
+    runtime.model, runtime.model_name, runtime.condition_model = model, "base", _Condition()
+    trainer.base.model = runtime
+    trainer.base.model_fwd_context = trainer.base.model_bwd_context = nullcontext()
+    trainer.base.num_micro_batches = 1
+    loss, _ = trainer.forward_backward_step({"value": [torch.tensor([0.2, 0.5])]})
+    assert torch.isfinite(loss) and model.weight.grad.abs() > 0
+    assert seen.count(("forward", enabled)) == (2 if checkpointed else 1)
+    assert seen.count(("backward", enabled)) == 1
+    assert all(mode == enabled for _, mode in seen)
+    assert not patch.is_batch_invariant_mode_enabled()
+
+
+@pytest.mark.parametrize("failure", ["forward", "backward"])
+@pytest.mark.parametrize("outer_enabled", [False, True])
+def test_dit_invariant_mode_restores_outer_state_on_failure(
+    monkeypatch, invariant_mode_on_cpu, failure, outer_enabled
+):
+    patch = invariant_mode_on_cpu
+    trainer = _trainer(monkeypatch, "offline_training", 1)
+    trainer.base.args.train.enable_batch_invariant_mode = not outer_enabled
+    model = _Model()
+
+    def fail(*args):
+        assert patch.is_batch_invariant_mode_enabled() == (not outer_enabled)
+        raise RuntimeError("injected failure")
+
+    if failure == "forward":
+        model.register_forward_pre_hook(fail)
+    else:
+        model.weight.register_hook(fail)
+    runtime = DiTModelRuntime.__new__(DiTModelRuntime)
+    runtime.model, runtime.model_name, runtime.condition_model = model, "base", _Condition()
+    trainer.base.model = runtime
+    trainer.base.model_fwd_context = trainer.base.model_bwd_context = nullcontext()
+    trainer.base.num_micro_batches = 1
+    with patch.set_batch_invariant_mode(outer_enabled):
+        with pytest.raises(RuntimeError, match="injected failure"):
+            trainer.forward_backward_step({"value": [torch.ones(1)]})
+        assert patch.is_batch_invariant_mode_enabled() == outer_enabled

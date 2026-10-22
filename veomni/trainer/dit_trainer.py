@@ -83,6 +83,14 @@ class DiTDataArguments(DataArguments):
         default=None,
         metadata={"help": "Path to save offline embeddings."},
     )
+    offline_embedding_max_buffer_mb: int = field(
+        default=256,
+        metadata={"help": "Maximum buffered serialized embedding payload in MiB; oversized rows are written alone."},
+    )
+    offline_embedding_max_rows_per_shard: int = field(
+        default=1000,
+        metadata={"help": "Maximum embedding rows per parquet shard; the byte limit may flush earlier."},
+    )
     data_transform: Optional[str] = field(
         default="dit_online",
         metadata={
@@ -94,6 +102,13 @@ class DiTDataArguments(DataArguments):
         default=True,
         metadata={"help": "Whether to print the first micro batch example to the log."},
     )
+
+    def __post_init__(self):
+        super().__post_init__()
+        for name in ("offline_embedding_max_buffer_mb", "offline_embedding_max_rows_per_shard"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"data.{name} must be a positive integer.")
 
 
 @dataclass
@@ -361,6 +376,8 @@ class DiTTrainer:
                 self.offline_embedding_saver = OfflineEmbeddingSaver(
                     save_path=self.offline_embedding_save_dir,
                     dataset_length=valid_data_length,
+                    max_buffer_bytes=args.data.offline_embedding_max_buffer_mb * 1024 * 1024,
+                    max_rows_per_shard=args.data.offline_embedding_max_rows_per_shard,
                     identity={
                         "data": asdict(args.data),
                         "model": asdict(args.model),

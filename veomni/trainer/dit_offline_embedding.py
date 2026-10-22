@@ -33,7 +33,23 @@ from .callbacks.global_state_callback import GlobalStateCallback
 class OfflineEmbeddingSaver:
     """Flush before the cursor checkpoint; reopen only at its committed shard boundary."""
 
-    def __init__(self, save_path, dataset_length=0, shard_num=1, max_shard=1000, *, identity=None):
+    def __init__(
+        self,
+        save_path,
+        dataset_length=0,
+        shard_num=1,
+        max_shard=1000,
+        *,
+        identity=None,
+        max_buffer_bytes=256 * 1024 * 1024,
+        max_rows_per_shard=1000,
+    ):
+        for name, value in (("max_buffer_bytes", max_buffer_bytes), ("max_rows_per_shard", max_rows_per_shard)):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        self.max_buffer_bytes = max_buffer_bytes
+        self.max_rows_per_shard = max_rows_per_shard
+        self.buffer_bytes = 0
         state = get_parallel_state()
         self.dp_rank = state.dp_rank
         self.dp_size = state.dp_size
@@ -49,6 +65,8 @@ class OfflineEmbeddingSaver:
             "dp_rank": self.dp_rank,
             "length": dataset_length,
             "batch_len": self.batch_len,
+            "max_buffer_bytes": self.max_buffer_bytes,
+            "max_rows_per_shard": self.max_rows_per_shard,
         }
         self.buffer = []
         self.shards = []
@@ -125,9 +143,19 @@ class OfflineEmbeddingSaver:
             self.open()
         if self.rest_len == 0:
             return  # Ignore the sampler's trailing padding rows.
-        self.buffer.append({k: pickle.dumps(self._cpu_recursive(v)) for k, v in item.items()})
+        encoded = {k: pickle.dumps(self._cpu_recursive(v)) for k, v in item.items()}
+        row_bytes = sum(len(value) for value in encoded.values())
+        # Flush the preceding rows before admitting one that would exceed the budget.
+        # A single oversized row stays intact and is written as its own shard below.
+        if self.buffer and self.buffer_bytes + row_bytes > self.max_buffer_bytes:
+            self.save_last()
+        self.buffer.append(encoded)
+        self.buffer_bytes += row_bytes
         self.rest_len -= 1
-        if len(self.buffer) >= self.batch_len:
+        if (
+            len(self.buffer) >= min(self.batch_len, self.max_rows_per_shard)
+            or self.buffer_bytes >= self.max_buffer_bytes
+        ):
             self.save_last()
 
     def save_last(self):
@@ -143,6 +171,7 @@ class OfflineEmbeddingSaver:
         os.replace(temporary, path)
         self.shards.append({"rows": len(self.buffer), "sha256": digest})
         self.buffer = []
+        self.buffer_bytes = 0
         self.index += 1
 
     def state_dict(self):

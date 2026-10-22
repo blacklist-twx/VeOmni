@@ -71,6 +71,8 @@ data:
     height: 480
     width: 832
   offline_embedding_save_dir: output/minimax_h3_fl2va_embedding
+  offline_embedding_max_buffer_mb: 256
+  offline_embedding_max_rows_per_shard: 1000
 
 # -----------------------------------------------------------------------------
 # Training

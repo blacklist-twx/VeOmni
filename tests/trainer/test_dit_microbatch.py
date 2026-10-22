@@ -296,11 +296,12 @@ def _cache_transform(row):
     return [dict(row, augmentation=torch.rand(2) + random.random() + np.random.rand())]
 
 
-def _cache_trainer(monkeypatch, tmp_path, *, rank=0, dp_size=1, load_path=None, num_workers=0):
+def _cache_trainer(monkeypatch, tmp_path, *, rank=0, dp_size=1, load_path=None, num_workers=0, max_rows=1000):
     from veomni.trainer.dit_offline_embedding import DiTOfflineEmbeddingCallback
 
     trainer = _trainer(monkeypatch, "offline_embedding", micro_batch_size=2, dp_size=dp_size, dp_rank=rank)
     args = trainer.base.args
+    args.data.offline_embedding_max_rows_per_shard = max_rows
     args.data.dataloader.num_workers = num_workers
     args.data.dataloader.prefetch_factor = 2 if num_workers else None
     args.train.global_rank = rank
@@ -350,7 +351,8 @@ def _cache_rows(path):
 
 
 @pytest.mark.parametrize("crash", ["buffered", "flushed", "partial"])
-def test_offline_cache_resume_matches_uninterrupted_trainer(monkeypatch, tmp_path, crash):
+@pytest.mark.parametrize("max_rows", [1000, 3])
+def test_offline_cache_resume_matches_uninterrupted_trainer(monkeypatch, tmp_path, crash, max_rows):
     import random
 
     import numpy as np
@@ -358,7 +360,7 @@ def test_offline_cache_resume_matches_uninterrupted_trainer(monkeypatch, tmp_pat
     random.seed(123)
     np.random.seed(123)
     torch.manual_seed(123)
-    reference = _cache_trainer(monkeypatch, tmp_path / "reference")
+    reference = _cache_trainer(monkeypatch, tmp_path / "reference", max_rows=max_rows)
     for _ in range(reference.base.args.train_steps):
         reference.train_step(reference.base.data_iterator)
     reference.offline_embedding_saver.finalize()
@@ -367,7 +369,7 @@ def test_offline_cache_resume_matches_uninterrupted_trainer(monkeypatch, tmp_pat
     random.seed(123)
     np.random.seed(123)
     torch.manual_seed(123)
-    interrupted = _cache_trainer(monkeypatch, tmp_path / "resumed")
+    interrupted = _cache_trainer(monkeypatch, tmp_path / "resumed", max_rows=max_rows)
     for _ in range(3):
         interrupted.train_step(interrupted.base.data_iterator)
     writer = interrupted.offline_embedding_saver
@@ -380,9 +382,10 @@ def test_offline_cache_resume_matches_uninterrupted_trainer(monkeypatch, tmp_pat
         monkeypatch,
         tmp_path / "resumed",
         load_path=str(tmp_path / "resumed/checkpoints/global_step_2"),
+        max_rows=max_rows,
     )
     assert resumed.base.start_step == 2
-    assert len(list(resumed.offline_embedding_saver.save_path.glob("*.parquet"))) == 1
+    assert len(list(resumed.offline_embedding_saver.save_path.glob("*.parquet"))) == (1 if max_rows == 1000 else 2)
     for _ in range(resumed.base.start_step, resumed.base.args.train_steps):
         resumed.train_step(resumed.base.data_iterator)
     resumed.offline_embedding_saver.finalize()
@@ -444,3 +447,114 @@ def test_offline_saver_supports_direct_save_api(monkeypatch, tmp_path):
 def test_offline_cache_resume_rejects_worker_random_transforms(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="num_workers=0"):
         _cache_trainer(monkeypatch, tmp_path, num_workers=1)
+
+
+@pytest.mark.parametrize("name", ["max_buffer_bytes", "max_rows_per_shard"])
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_offline_saver_rejects_invalid_buffer_limits(monkeypatch, tmp_path, name, value):
+    _trainer(monkeypatch, "offline_embedding", 1)
+    with pytest.raises(ValueError, match=name):
+        OfflineEmbeddingSaver(str(tmp_path), dataset_length=1, **{name: value})
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["offline_embedding_max_buffer_mb", "offline_embedding_max_rows_per_shard"])
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_dit_data_arguments_reject_invalid_buffer_limits(name, value):
+    with pytest.raises(ValueError, match=name):
+        DiTDataArguments(train_path="unused", **{name: value})
+
+
+def test_offline_saver_bounds_variable_payload_and_keeps_oversized_rows(monkeypatch, tmp_path):
+    _trainer(monkeypatch, "offline_embedding", 1)
+    budget = 200
+    samples = [{"value": i, "payload": b"x" * n} for i, n in enumerate((10, 75, 300, 10, 30, 90, 15))]
+    saver = OfflineEmbeddingSaver(
+        str(tmp_path), dataset_length=len(samples), max_buffer_bytes=budget, max_rows_per_shard=3
+    )
+    for sample in samples:
+        saver.save(sample)
+        assert saver.buffer_bytes < budget
+        assert len(saver.buffer) < 3
+    saver.finalize()
+    assert saver.buffer_bytes == 0
+    assert _cache_rows(tmp_path) == samples
+    shards = list(tmp_path.glob("*.parquet"))
+    assert len(shards) > 1
+    for path in shards:
+        rows = Dataset.from_parquet(str(path))
+        payload_bytes = sum(len(value) for row in rows for value in row.values())
+        assert len(rows) <= 3
+        assert payload_bytes <= budget or (len(rows) == 1 and pickle.loads(rows[0]["value"]) == 2)
+
+
+def test_offline_saver_default_flushes_before_end_of_source(monkeypatch, tmp_path):
+    _trainer(monkeypatch, "offline_embedding", 1)
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=1100)
+    for i in range(1000):
+        saver.save({"value": i})
+    assert saver.index == 1
+    assert saver.buffer == []
+    assert saver.rest_len == 100
+    for i in range(1000, 1100):
+        saver.save({"value": i})
+    saver.finalize()
+    assert [shard["rows"] for shard in saver.shards] == [1000, 100]
+    assert [row["value"] for row in _cache_rows(tmp_path)] == list(range(1100))
+
+
+def test_offline_saver_preserves_explicit_shard_count(monkeypatch, tmp_path):
+    _trainer(monkeypatch, "offline_embedding", 1)
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=12, shard_num=6)
+    for i in range(12):
+        saver.save({"value": i})
+    saver.finalize()
+    assert [shard["rows"] for shard in saver.shards] == [2] * 6
+    assert [row["value"] for row in _cache_rows(tmp_path)] == list(range(12))
+
+
+@pytest.mark.parametrize("changed", [{"max_rows_per_shard": 2}, {"max_buffer_bytes": 100}])
+def test_offline_saver_resume_rejects_changed_buffer_limits(monkeypatch, tmp_path, changed):
+    _trainer(monkeypatch, "offline_embedding", 1)
+    original = OfflineEmbeddingSaver(str(tmp_path), dataset_length=3)
+    original.save({"value": 0})
+    state = original.state_dict()
+    resumed = OfflineEmbeddingSaver(str(tmp_path), dataset_length=3, **changed)
+    resumed.load_state_dict(state)
+    with pytest.raises(ValueError, match="configuration"):
+        resumed.open()
+    assert _cache_rows(tmp_path) == [{"value": 0}]
+
+
+def test_offline_buffer_config_reaches_writer(monkeypatch, tmp_path):
+    trainer = _trainer(monkeypatch, "offline_embedding", 1)
+    trainer.base.args.data.offline_embedding_max_buffer_mb = 2
+    trainer.base.args.data.offline_embedding_max_rows_per_shard = 7
+    trainer.base.train_dataset = MappingDataset([{"value": i} for i in range(19)])
+    trainer.base._build_dataset = Mock()
+    trainer.offline_embedding_save_dir = str(tmp_path)
+    trainer._build_dataset()
+    assert trainer.offline_embedding_saver.max_buffer_bytes == 2 * 1024 * 1024
+    assert trainer.offline_embedding_saver.max_rows_per_shard == 7
+
+
+def test_offline_saver_byte_limit_resume_discards_uncommitted_shard(monkeypatch, tmp_path):
+    _trainer(monkeypatch, "offline_embedding", 1)
+    samples = [{"value": i, "payload": b"x" * n} for i, n in enumerate((120, 120, 300, 10, 15))]
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=len(samples), max_buffer_bytes=200)
+    saver.save(samples[0])
+    saver.save(samples[1])
+    checkpoint = saver.state_dict()
+    assert saver.index == 2
+    saver.save(samples[2])  # oversized row writes immediately, beyond the committed cursor
+    assert saver.index == 3
+    resumed = OfflineEmbeddingSaver(str(tmp_path), dataset_length=len(samples), max_buffer_bytes=200)
+    resumed.load_state_dict(checkpoint)
+    resumed.open()
+    assert resumed.index == 2
+    assert resumed.buffer_bytes == 0
+    for sample in samples[2:]:
+        resumed.save(sample)
+    resumed.save({"value": 999, "payload": b"padding"})
+    resumed.finalize()
+    assert _cache_rows(tmp_path) == samples

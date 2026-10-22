@@ -54,6 +54,24 @@ encoder and host-memory budget. Embedding disables sampler shuffling and pads
 only an index view of the source dataset; the saver discards trailing repeats
 so each original sample is written once.
 
+### Bounded cache buffering
+
+Embedding flushes a shard when its serialized payload reaches 256 MiB or it
+contains 1,000 rows, even when checkpointing is disabled. Configure the limits:
+
+```yaml
+data:
+  offline_embedding_max_buffer_mb: 256
+  offline_embedding_max_rows_per_shard: 1000
+```
+
+Both values must be positive integers. The byte budget counts pickled column
+values, not process RSS or compressed parquet size; the current sample, encoder
+outputs and parquet conversion also use memory. A row larger than the budget is
+written alone. Explicit `OfflineEmbeddingSaver(shard_num=...)` splitting still
+applies; these limits can produce additional, smaller shards. Resume with the
+same limits as the checkpoint.
+
 ### Resuming embedding
 
 Use the existing checkpoint options to save the cache position together with

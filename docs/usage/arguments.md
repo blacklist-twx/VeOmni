@@ -971,6 +971,8 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
+| offline_embedding_max_buffer_mb | `int` | `256` | Maximum buffered serialized embedding payload in MiB; oversized rows are written alone. |
+| offline_embedding_max_rows_per_shard | `int` | `1000` | Maximum embedding rows per parquet shard; the byte limit may flush earlier. |
 
 ### DiTTrainingArguments
 
